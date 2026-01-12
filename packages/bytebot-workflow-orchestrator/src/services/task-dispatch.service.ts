@@ -380,11 +380,11 @@ export class TaskDispatchService implements OnModuleInit {
         highRiskTools: request.highRiskTools || [],
         gatewayToolsOnly: false,
         // Phase 4: Execution surface constraints - forward desktop requirement
-        requiresDesktop: request.requiresDesktop || false,
+        requiresDesktop: request.requiresDesktop ?? false,
         // PR5: ExecutionSurface propagation (end-to-end)
         executionSurface:
           request.executionSurface ??
-          ((request.requiresDesktop || false) ? ExecutionSurface.DESKTOP : ExecutionSurface.TEXT_ONLY),
+          ((request.requiresDesktop ?? false) ? ExecutionSurface.DESKTOP : ExecutionSurface.TEXT_ONLY),
         // v2.4.0: Context propagation for autonomous operation
         // Provides goal context and previous step results to help agent proceed without asking
         goalContext: request.goalContext,
