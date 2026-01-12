@@ -22,6 +22,7 @@ import { Connection, Client } from '@temporalio/client';
 import { TemporalWorkflowService } from './temporal-workflow.service';
 import { FeatureFlagService } from './feature-flag.service';
 import { TEMPORAL_CLIENT, TEMPORAL_CONNECTION } from './constants';
+import { TemporalCapabilityProbeService } from './temporal-capability-probe.service';
 
 /**
  * Retry helper for Temporal connection with exponential backoff
@@ -77,6 +78,7 @@ async function connectWithRetry(
   providers: [
     TemporalWorkflowService,
     FeatureFlagService,
+    TemporalCapabilityProbeService,
     {
       provide: TEMPORAL_CONNECTION,
       useFactory: async (configService: ConfigService): Promise<Connection | null> => {
@@ -127,7 +129,13 @@ async function connectWithRetry(
       inject: [TEMPORAL_CONNECTION, ConfigService],
     },
   ],
-  exports: [TEMPORAL_CLIENT, TEMPORAL_CONNECTION, TemporalWorkflowService, FeatureFlagService],
+  exports: [
+    TEMPORAL_CLIENT,
+    TEMPORAL_CONNECTION,
+    TemporalWorkflowService,
+    FeatureFlagService,
+    TemporalCapabilityProbeService,
+  ],
 })
 export class TemporalModule implements OnModuleDestroy {
   private readonly logger = new Logger(TemporalModule.name);

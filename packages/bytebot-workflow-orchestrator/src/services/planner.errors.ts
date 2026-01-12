@@ -1,4 +1,5 @@
 import { StepType } from '@prisma/client';
+import { hasUserInteractionTool } from '../contracts/planner-tools';
 
 export type PlannerChecklistItem = {
   description: string;
@@ -10,8 +11,7 @@ export type PlannerChecklistItem = {
 
 export type PlannerFirstStepUserInputReason =
   | 'USER_INPUT_REQUIRED_TYPE'
-  | 'ASK_USER_TOOL'
-  | 'LIKELY_USER_INPUT_DESCRIPTION';
+  | 'ASK_USER_TOOL';
 
 /**
  * Raised when the planner attempts to start a plan with a user-interaction step.
@@ -43,18 +43,7 @@ export function detectPlannerFirstStepUserInputReason(
   firstStep: PlannerChecklistItem,
 ): PlannerFirstStepUserInputReason | null {
   if (firstStep.type === StepType.USER_INPUT_REQUIRED) return 'USER_INPUT_REQUIRED_TYPE';
-  if ((firstStep.suggestedTools ?? []).includes('ASK_USER')) return 'ASK_USER_TOOL';
-
-  // Last-resort safety net: some models misclassify an ask-user step as EXECUTE without tagging tools.
-  // Keep this narrow to avoid false positives.
-  const description = firstStep.description.toLowerCase();
-  if (description.includes('ask the user') || description.includes('ask user')) {
-    return 'LIKELY_USER_INPUT_DESCRIPTION';
-  }
-  if (description.includes('confirm with the user') || description.includes('clarify with the user')) {
-    return 'LIKELY_USER_INPUT_DESCRIPTION';
-  }
+  if (hasUserInteractionTool(firstStep.suggestedTools)) return 'ASK_USER_TOOL';
 
   return null;
 }
-

@@ -43,7 +43,10 @@ import { IsString, IsOptional, IsBoolean, IsArray, IsNumber, ValidateNested, IsE
 import { Type } from 'class-transformer';
 import { TaskDispatchService } from '../services/task-dispatch.service';
 import { PrismaService } from '../services/prisma.service';
-import { ExecutionSurface } from '@prisma/client';
+import { GoalIntakeService } from '../services/goal-intake.service';
+import { detectPlannerFirstStepUserInputReason, PlannerFirstStepUserInputError } from '../services/planner.errors';
+import { ExecutionSurface, StepType } from '@prisma/client';
+import { normalizeSuggestedToolsOrThrow } from '../contracts/planner-tools';
 
 // ============================================================================
 // DTOs
@@ -215,6 +218,7 @@ class PlanRequestDto {
  * Phase 14.2: Response from plan generation
  */
 interface PlanResponse {
+  kind: 'PLAN';
   steps: Array<{
     stepNumber: number;
     description: string;
@@ -227,6 +231,15 @@ interface PlanResponse {
   estimatedDurationMs?: number;
   confidence?: number;
 }
+
+interface GoalIntakeRequiredResponse {
+  kind: 'GOAL_INTAKE_REQUIRED';
+  goalSpecId: string;
+  promptId: string;
+  reason: string;
+}
+
+type InternalPlanResponse = PlanResponse | GoalIntakeRequiredResponse;
 
 // ============================================================================
 // Controller
@@ -246,6 +259,7 @@ export class InternalController {
     private readonly taskDispatchService: TaskDispatchService,
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
+    private readonly goalIntakeService: GoalIntakeService,
   ) {
     // Read LLM config from environment (set in K8s deployment)
     // LLM_API_URL → http://litellm.llm.svc.cluster.local:4000/v1/messages
@@ -573,7 +587,7 @@ Respond in JSON format:
   async generatePlan(
     @Body() body: PlanRequestDto,
     @Headers('x-internal-request') internalHeader?: string,
-  ): Promise<PlanResponse> {
+  ): Promise<InternalPlanResponse> {
     this.validateInternalRequest(internalHeader);
 
     this.logger.log({
@@ -586,6 +600,28 @@ Respond in JSON format:
     const startTime = Date.now();
 
     try {
+      // Stark rule: do not plan until GoalSpec is COMPLETE.
+      const intakeGate = await this.goalIntakeService.ensureGoalSpecReadyForPlanning({
+        goalRunId: body.goalRunId,
+        tenantId: body.tenantId,
+      });
+
+      if (!intakeGate.ready) {
+        this.logger.warn({
+          message: 'Goal intake required before planning (GoalSpec gate)',
+          goalRunId: body.goalRunId,
+          goalSpecId: intakeGate.goalSpecId,
+          promptId: intakeGate.promptId,
+        });
+
+        return {
+          kind: 'GOAL_INTAKE_REQUIRED',
+          goalSpecId: intakeGate.goalSpecId,
+          promptId: intakeGate.promptId,
+          reason: 'GOAL_SPEC_INCOMPLETE',
+        };
+      }
+
       // Build the planning prompt with proper granularity guidance
       const planningPrompt = this.buildPlanningPrompt(body);
 
@@ -610,8 +646,19 @@ Respond in JSON format:
         }
       }
 
-      // Validate and normalize steps
-      const steps = (parsed.steps || []).map((step: any, index: number) => ({
+      const rawSteps = Array.isArray(parsed.steps) ? parsed.steps : [];
+
+      // Fail-closed planner output validation: unknown tool tokens cannot proceed.
+      // This is a contract boundary; do not rely on UI heuristics or NL matching.
+      for (const rawStep of rawSteps) {
+        normalizeSuggestedToolsOrThrow({
+          suggestedTools: Array.isArray(rawStep?.suggestedTools) ? rawStep.suggestedTools : [],
+          allowedTools: body.constraints?.allowedTools,
+        });
+      }
+
+      // Validate and normalize steps (Temporal workflow step schema)
+      const steps = rawSteps.map((step: any, index: number) => ({
         stepNumber: step.stepNumber ?? index + 1,
         description: step.description,
         expectedOutcome: step.expectedOutcome,
@@ -619,6 +666,57 @@ Respond in JSON format:
         dependencies: step.dependencies ?? [],
         estimatedDurationMs: step.estimatedDurationMs,
       }));
+
+      // Safety net: if the model tries to start with an ask-user step, convert it into a Goal Intake prompt.
+      const firstRawStep = rawSteps[0];
+      const firstStepDescription =
+        typeof firstRawStep?.description === 'string'
+          ? firstRawStep.description
+          : typeof steps?.[0]?.description === 'string'
+            ? steps[0].description
+            : '';
+
+      const firstStep = {
+        description: firstStepDescription,
+        type: firstRawStep?.type === StepType.USER_INPUT_REQUIRED ? StepType.USER_INPUT_REQUIRED : StepType.EXECUTE,
+        expectedOutcome:
+          typeof firstRawStep?.expectedOutcome === 'string' ? firstRawStep.expectedOutcome : steps?.[0]?.expectedOutcome,
+        suggestedTools: normalizeSuggestedToolsOrThrow({
+          suggestedTools: Array.isArray(firstRawStep?.suggestedTools) ? firstRawStep.suggestedTools : [],
+          allowedTools: body.constraints?.allowedTools,
+        }),
+        requiresDesktop: typeof firstRawStep?.requiresDesktop === 'boolean' ? firstRawStep.requiresDesktop : false,
+      };
+
+      const promptFirstReason = firstStep.description ? detectPlannerFirstStepUserInputReason(firstStep) : null;
+      if (promptFirstReason) {
+        const error = new PlannerFirstStepUserInputError({
+          mode: 'initial',
+          firstStep,
+          reason: promptFirstReason,
+        });
+
+        const intake = await this.goalIntakeService.requestGoalIntakeFromPlannerError({
+          goalRunId: body.goalRunId,
+          tenantId: body.tenantId,
+          error,
+        });
+
+        this.logger.warn({
+          message: 'Planner produced a prompt-first plan; issuing Goal Intake prompt instead',
+          goalRunId: body.goalRunId,
+          goalSpecId: intake.goalSpecId,
+          promptId: intake.promptId,
+          reason: error.reason,
+        });
+
+        return {
+          kind: 'GOAL_INTAKE_REQUIRED',
+          goalSpecId: intake.goalSpecId,
+          promptId: intake.promptId,
+          reason: error.reason,
+        };
+      }
 
       const durationMs = Date.now() - startTime;
       this.logger.log({
@@ -630,6 +728,7 @@ Respond in JSON format:
       });
 
       return {
+        kind: 'PLAN',
         steps,
         planSummary: parsed.planSummary || parsed.summary || 'Generated plan',
         estimatedDurationMs: parsed.estimatedDurationMs,
@@ -709,6 +808,9 @@ ${body.constraints?.riskPolicy?.requireApproval?.length ? `- Actions requiring a
     {
       "stepNumber": 1,
       "description": "Clear task-level description (NOT individual mouse/keyboard actions)",
+      "type": "EXECUTE | USER_INPUT_REQUIRED",
+      "suggestedTools": [],
+      "requiresDesktop": true,
       "expectedOutcome": "What should be observable when this step succeeds",
       "isHighRisk": false,
       "dependencies": [],
@@ -727,6 +829,9 @@ ${body.constraints?.riskPolicy?.requireApproval?.length ? `- Actions requiring a
 5. **High-Risk Marking**: Mark steps that submit data, make purchases, or modify external systems as isHighRisk: true
 6. **Desktop-Achievable**: Every step must be achievable through desktop interactions (no API calls)
 7. **Specific but Not Granular**: Be specific about what to do, but don't specify individual clicks/keystrokes
+8. **Tool Vocabulary (Fail-Closed)**: suggestedTools MUST be [] or a subset of the Allowed tools list. Never invent tool tokens.
+9. **User Interaction Tooling**: If a step requires user input, set type=USER_INPUT_REQUIRED and suggestedTools=["ASK_USER"] (never "CHAT").
+10. **No Prompt-First Plans**: The FIRST step MUST NOT require user input. If you need clarification to start, assume safe defaults and begin with an EXECUTE step.
 
 ## Example Good Plan
 Goal: "Search for flights from NYC to Paris and find the cheapest option"
@@ -745,6 +850,7 @@ Generate the plan:`;
    */
   private generateFallbackPlan(goal: string): PlanResponse {
     return {
+      kind: 'PLAN',
       steps: [
         {
           stepNumber: 1,

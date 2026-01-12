@@ -44,6 +44,12 @@ import {
 } from '@prisma/client';
 import { z } from 'zod';
 import { detectPlannerFirstStepUserInputReason, PlannerFirstStepUserInputError } from './planner.errors';
+import {
+  ExecuteStepHasInteractionToolError,
+  PlannerOutputContractViolationError,
+  hasUserInteractionTool,
+  normalizeSuggestedToolsOrThrow,
+} from '../contracts/planner-tools';
 
 // Zod schema for LLM plan output validation
 const ChecklistItemSchema = z.object({
@@ -641,29 +647,63 @@ export class PlannerService {
     constraints: any,
     options?: { goalSpecContext?: string },
   ): Promise<PlanOutput> {
-    const prompt = this.buildPlanningPrompt(goal, constraints, options?.goalSpecContext);
+    const basePrompt = this.buildPlanningPrompt(goal, constraints, options?.goalSpecContext);
+    const maxContractAttempts = 2;
 
-    try {
-      const response = await this.callLLM(prompt);
-      const parsed = this.parseLLMResponse(response);
+    let lastContractError: PlannerOutputContractViolationError | null = null;
 
-      // Validate
-      const validation = await this.validatePlan(parsed);
-      if (!validation.valid) {
-        this.logger.warn(`Plan validation failed: ${validation.errors.join(', ')}`);
-        // Return a fallback simple plan
+    for (let attempt = 1; attempt <= maxContractAttempts; attempt++) {
+      const prompt =
+        attempt === 1
+          ? basePrompt
+          : `${basePrompt}\n\n` +
+            `CORRECTION REQUIRED:\n` +
+            `- Your previous JSON violated the planner-output contract.\n` +
+            `- suggestedTools MUST be either [] or a subset of the Allowed tools list. Do not invent tool tokens.\n` +
+            `- If a step requires user clarification, set type=USER_INPUT_REQUIRED and suggestedTools=[\"ASK_USER\"] (never \"CHAT\").\n`;
+
+      try {
+        const response = await this.callLLM(prompt);
+        const parsed = this.parseLLMResponse(response);
+
+        // Validate
+        const validation = await this.validatePlan(parsed);
+        if (!validation.valid) {
+          this.logger.warn(`Plan validation failed: ${validation.errors.join(', ')}`);
+          // Return a fallback simple plan
+          return this.generateFallbackPlan(goal);
+        }
+
+        return this.normalizePlanOutput(parsed as PlanOutput, {
+          goal,
+          mode: 'initial',
+          allowedTools: constraints?.allowedTools,
+        });
+      } catch (error: any) {
+        if (error instanceof PlannerFirstStepUserInputError) {
+          throw error;
+        }
+
+        if (error instanceof PlannerOutputContractViolationError) {
+          lastContractError = error;
+          this.logger.warn(
+            `Planner output contract violation on attempt ${attempt}/${maxContractAttempts}: ${error.code}`,
+          );
+          continue;
+        }
+
+        this.logger.error(`LLM call failed: ${error.message}`);
+        // Return fallback plan
         return this.generateFallbackPlan(goal);
       }
-
-      return this.normalizePlanOutput(parsed as PlanOutput, { goal, mode: 'initial' });
-    } catch (error: any) {
-      if (error instanceof PlannerFirstStepUserInputError) {
-        throw error;
-      }
-      this.logger.error(`LLM call failed: ${error.message}`);
-      // Return fallback plan
-      return this.generateFallbackPlan(goal);
     }
+
+    // Fail-closed: do not persist a plan with drifted/unknown tool vocabulary.
+    if (lastContractError) {
+      throw lastContractError;
+    }
+
+    return this.generateFallbackPlan(goal);
   }
 
   private async callLLMForReplan(
@@ -674,43 +714,110 @@ export class PlannerService {
     context?: { failedItemId?: string; failureDetails?: string },
     userPromptContext?: string,
   ): Promise<PlanOutput> {
-    const prompt = this.buildReplanningPrompt(goal, constraints, currentPlan, reason, context, userPromptContext);
+    const basePrompt = this.buildReplanningPrompt(goal, constraints, currentPlan, reason, context, userPromptContext);
+    const maxContractAttempts = 2;
 
-    try {
-      const response = await this.callLLM(prompt);
-      const parsed = this.parseLLMResponse(response);
+    let lastContractError: PlannerOutputContractViolationError | null = null;
 
-      const validation = await this.validatePlan(parsed);
-      if (!validation.valid) {
-        this.logger.warn(`Replan validation failed: ${validation.errors.join(', ')}`);
+    for (let attempt = 1; attempt <= maxContractAttempts; attempt++) {
+      const prompt =
+        attempt === 1
+          ? basePrompt
+          : `${basePrompt}\n\n` +
+            `CORRECTION REQUIRED:\n` +
+            `- Your previous JSON violated the planner-output contract.\n` +
+            `- suggestedTools MUST be either [] or a subset of the Allowed tools list. Do not invent tool tokens.\n` +
+            `- If a step requires user clarification, set type=USER_INPUT_REQUIRED and suggestedTools=[\"ASK_USER\"] (never \"CHAT\").\n`;
+
+      try {
+        const response = await this.callLLM(prompt);
+        const parsed = this.parseLLMResponse(response);
+
+        const validation = await this.validatePlan(parsed);
+        if (!validation.valid) {
+          this.logger.warn(`Replan validation failed: ${validation.errors.join(', ')}`);
+          return this.generateFallbackPlan(goal);
+        }
+
+        return this.normalizePlanOutput(parsed as PlanOutput, {
+          goal,
+          mode: 'replan',
+          allowedTools: constraints?.allowedTools,
+        });
+      } catch (error: any) {
+        if (error instanceof PlannerFirstStepUserInputError) {
+          throw error;
+        }
+
+        if (error instanceof PlannerOutputContractViolationError) {
+          lastContractError = error;
+          this.logger.warn(
+            `Planner replan output contract violation on attempt ${attempt}/${maxContractAttempts}: ${error.code}`,
+          );
+          continue;
+        }
+
+        this.logger.error(`LLM replan call failed: ${error.message}`);
         return this.generateFallbackPlan(goal);
       }
-
-      return this.normalizePlanOutput(parsed as PlanOutput, { goal, mode: 'replan' });
-    } catch (error: any) {
-      if (error instanceof PlannerFirstStepUserInputError) {
-        throw error;
-      }
-      this.logger.error(`LLM replan call failed: ${error.message}`);
-      return this.generateFallbackPlan(goal);
     }
+
+    if (lastContractError) {
+      throw lastContractError;
+    }
+
+    return this.generateFallbackPlan(goal);
   }
 
   private normalizePlanOutput(
     planOutput: PlanOutput,
-    context: { goal: string; mode: 'initial' | 'replan' },
+    context: { goal: string; mode: 'initial' | 'replan'; allowedTools?: string[] | null },
   ): PlanOutput {
     const maxItems = 20;
     const items = Array.isArray(planOutput.items) ? [...planOutput.items] : [];
     if (items.length === 0) return planOutput;
 
-    const first = items[0];
+    const normalizedItems = items.slice(0, maxItems).map((item) => {
+      const suggestedTools = normalizeSuggestedToolsOrThrow({
+        suggestedTools: item.suggestedTools,
+        allowedTools: context.allowedTools,
+      });
+
+      if (item.type === StepType.USER_INPUT_REQUIRED) {
+        return {
+          ...item,
+          suggestedTools: ['ASK_USER'],
+          requiresDesktop: false,
+        };
+      }
+
+      return { ...item, suggestedTools };
+    });
+
+    const first = normalizedItems[0];
     const reason = detectPlannerFirstStepUserInputReason(first);
     if (reason) {
       throw new PlannerFirstStepUserInputError({ mode: context.mode, firstStep: first, reason });
     }
 
-    return { ...planOutput, items: items.slice(0, maxItems) };
+    // Safety rail: an EXECUTE step may never be "interaction-shaped" anywhere in the plan.
+    for (let i = 1; i < normalizedItems.length; i++) {
+      const item = normalizedItems[i];
+      if (item.type === StepType.EXECUTE && hasUserInteractionTool(item.suggestedTools)) {
+        const interactionTool = normalizeSuggestedToolsOrThrow({
+          suggestedTools: item.suggestedTools,
+          allowedTools: context.allowedTools,
+        }).find((t) => hasUserInteractionTool([t]));
+
+        throw new ExecuteStepHasInteractionToolError({
+          stepIndex: i,
+          stepDescription: item.description,
+          interactionTool: interactionTool ?? 'ASK_USER',
+        });
+      }
+    }
+
+    return { ...planOutput, items: normalizedItems };
   }
 
   private buildPlanningPrompt(goal: string, constraints: any, goalSpecContext?: string): string {
@@ -747,9 +854,10 @@ RULES:
 3. Steps should be in logical execution order
 4. Include expected outcomes for verification
 5. Mark steps requiring desktop interaction
-6. If a step requires user clarification, set type=USER_INPUT_REQUIRED, requiresDesktop=false, and include suggestedTools=["ASK_USER"]
-7. The FIRST step MUST NOT be USER_INPUT_REQUIRED (or suggestedTools=["ASK_USER"]). If clarification is needed to start, assume safe defaults and proceed with an EXECUTE step.
-8. Consider potential failure points
+6. suggestedTools MUST be [] or a subset of the Allowed tools list. Never invent tool tokens.
+7. If a step requires user clarification, set type=USER_INPUT_REQUIRED, requiresDesktop=false, and include suggestedTools=["ASK_USER"] (never "CHAT")
+8. The FIRST step MUST NOT be USER_INPUT_REQUIRED (or suggestedTools=["ASK_USER"]). If clarification is needed to start, assume safe defaults and proceed with an EXECUTE step.
+9. Consider potential failure points
 
 Generate the plan:`;
   }
@@ -884,8 +992,9 @@ CRITICAL RULES:
 5. Set "isPreservedFromPrevious": true for any steps you're keeping from the original plan
 6. The goal is to CONTINUE from where we left off, not start over
 7. Be more specific than the previous plan for steps that failed
-8. If a step requires user clarification, set type=USER_INPUT_REQUIRED, requiresDesktop=false, and include suggestedTools=["ASK_USER"]
-9. The FIRST NEW step you generate MUST NOT be USER_INPUT_REQUIRED (or suggestedTools=["ASK_USER"]). If clarification is needed, start with an EXECUTE "preflight" step that extracts assumptions/defaults, then ask the user in a later step.
+8. suggestedTools MUST be [] or a subset of the Allowed tools list. Never invent tool tokens.
+9. If a step requires user clarification, set type=USER_INPUT_REQUIRED, requiresDesktop=false, and include suggestedTools=["ASK_USER"] (never "CHAT")
+10. The FIRST NEW step you generate MUST NOT be USER_INPUT_REQUIRED (or suggestedTools=["ASK_USER"]). If clarification is needed, start with an EXECUTE "preflight" step that extracts assumptions/defaults, then ask the user in a later step.
 
 EXAMPLE OF GOOD REPLANNING:
 - If "Search for flights" COMPLETED with results showing "Found $299 on United"

@@ -458,6 +458,19 @@ import { PrometheusModule, makeCounterProvider, makeGaugeProvider, makeHistogram
       name: 'prompts_resolved_without_resume_ack_total',
       help: 'Number of resolved prompts missing resume_acknowledged_at',
     }),
+
+    // =========================================================================
+    // Temporal Rollout Guardrails (Capability Probe)
+    // =========================================================================
+
+    makeGaugeProvider({
+      name: 'temporal_capability_probe_ok',
+      help: '1 if orchestrator can reach Temporal service APIs; 0 otherwise',
+    }),
+    makeCounterProvider({
+      name: 'temporal_capability_probe_failures_total',
+      help: 'Total Temporal capability probe failures',
+    }),
   ],
   exports: [
     PrometheusModule,
@@ -476,6 +489,9 @@ import { PrometheusModule, makeCounterProvider, makeGaugeProvider, makeHistogram
     'PROM_METRIC_RESUME_UPDATE_FAILED_TOTAL',
     'PROM_METRIC_RUNS_STUCK_WAITING_USER_INPUT_TOTAL',
     'PROM_METRIC_PROMPTS_RESOLVED_WITHOUT_RESUME_ACK_TOTAL',
+
+    'PROM_METRIC_TEMPORAL_CAPABILITY_PROBE_OK',
+    'PROM_METRIC_TEMPORAL_CAPABILITY_PROBE_FAILURES_TOTAL',
   ],
 })
 export class MetricsModule {}

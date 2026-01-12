@@ -31,6 +31,8 @@ import {
 } from '@prisma/client';
 import { TemporalWorkflowService } from '../temporal/temporal-workflow.service';
 import { FeatureFlagService } from '../temporal/feature-flag.service';
+import { hasUserInteractionTool } from '../contracts/planner-tools';
+import { TemporalCapabilityProbeService } from '../temporal/temporal-capability-probe.service';
 
 // Re-export enums for convenience
 export { GoalRunPhase, GoalRunStatus, ChecklistItemStatus };
@@ -146,6 +148,7 @@ export class GoalRunService {
     private eventEmitter: EventEmitter2,
     @Optional() private temporalWorkflowService?: TemporalWorkflowService,
     @Optional() private featureFlagService?: FeatureFlagService,
+    @Optional() private temporalCapabilityProbeService?: TemporalCapabilityProbeService,
   ) {}
 
   /**
@@ -153,6 +156,13 @@ export class GoalRunService {
    */
   private shouldUseTemporalWorkflow(goalRunId: string, tenantId: string, goal?: string): boolean {
     if (!this.temporalWorkflowService?.isEnabled() || !this.featureFlagService) {
+      return false;
+    }
+
+    // Defense-in-depth: if the Temporal capability probe is red, do not route new runs to Temporal.
+    if (this.temporalCapabilityProbeService && !this.temporalCapabilityProbeService.isHealthyForTraffic()) {
+      const reason = this.temporalCapabilityProbeService.getLastError() ?? 'unknown';
+      this.logger.warn(`Temporal capability probe is red; routing ${goalRunId} to legacy. reason=${reason}`);
       return false;
     }
 
@@ -1178,8 +1188,8 @@ export class GoalRunService {
   private toChecklistItemResponse(item: any): ChecklistItemResponse {
     const type: StepType = item.type ?? StepType.EXECUTE;
     const suggestedTools: string[] = Array.isArray(item.suggestedTools) ? item.suggestedTools : [];
-    const isExternalInput = type === StepType.USER_INPUT_REQUIRED || suggestedTools.includes('ASK_USER');
-    const isLegacyPromptStep = type !== StepType.USER_INPUT_REQUIRED && suggestedTools.includes('ASK_USER');
+    const isExternalInput = type === StepType.USER_INPUT_REQUIRED || hasUserInteractionTool(suggestedTools);
+    const isLegacyPromptStep = type !== StepType.USER_INPUT_REQUIRED && hasUserInteractionTool(suggestedTools);
 
     return {
       id: item.id,
