@@ -32,6 +32,7 @@ import axios, { AxiosInstance } from 'axios';
 import {
   ChecklistItemStatus,
   ExecutionSurface,
+  GoalRunExecutionEngine,
   GoalRunPhase,
   UserPromptKind,
   UserPromptStatus,
@@ -866,38 +867,67 @@ export class TaskDispatchService implements OnModuleInit {
 
     const goalRunTenant = await this.prisma.goalRun.findUnique({
       where: { id: record.goalRunId },
-      select: { tenantId: true },
+      select: { tenantId: true, executionEngine: true },
     });
     if (!goalRunTenant?.tenantId) {
       throw new Error(`GoalRun ${record.goalRunId} not found (tenantId missing)`);
     }
 
-    const prompt = await this.userPromptService.ensureOpenPromptForStep({
-      tenantId: goalRunTenant.tenantId,
-      goalRunId: record.goalRunId,
-      checklistItemId: record.checklistItemId,
-      kind: promptKind,
-      payload: {
-        goalRunId: record.goalRunId,
-        checklistItemId: record.checklistItemId,
-        taskId: record.taskId,
-        workspaceId: task.workspaceId ?? null,
-        requiresDesktop: task.requiresDesktop ?? false,
-        title: task.title || null,
-        result: task.result ?? null,
-        error: task.error ?? null,
-        reason: 'Task requires user input to continue',
-        links: {
-          desktopTakeover: desktopTakeoverLink,
-        },
-      },
-    });
+    const isTemporal = goalRunTenant.executionEngine === GoalRunExecutionEngine.TEMPORAL_WORKFLOW;
+    const stepKey =
+      isTemporal && record.checklistItemId.startsWith(`${record.goalRunId}-`)
+        ? record.checklistItemId.slice(record.goalRunId.length + 1)
+        : record.checklistItemId;
 
-    const stepTransitioned = await this.transitionChecklistItemToBlockedWaitingUser(record, task.title, {
-      promptId: prompt.id,
-      promptKind: prompt.kind,
-      promptDedupeKey: prompt.dedupeKey,
-    });
+    const prompt = isTemporal
+      ? await this.userPromptService.ensureOpenPromptForStepKey({
+          tenantId: goalRunTenant.tenantId,
+          goalRunId: record.goalRunId,
+          stepKey,
+          kind: promptKind,
+          payload: {
+            goalRunId: record.goalRunId,
+            stepKey,
+            taskId: record.taskId,
+            workspaceId: task.workspaceId ?? null,
+            requiresDesktop: task.requiresDesktop ?? false,
+            title: task.title || null,
+            result: task.result ?? null,
+            error: task.error ?? null,
+            reason: 'Task requires user input to continue',
+            links: {
+              desktopTakeover: desktopTakeoverLink,
+            },
+          },
+        })
+      : await this.userPromptService.ensureOpenPromptForStep({
+          tenantId: goalRunTenant.tenantId,
+          goalRunId: record.goalRunId,
+          checklistItemId: record.checklistItemId,
+          kind: promptKind,
+          payload: {
+            goalRunId: record.goalRunId,
+            checklistItemId: record.checklistItemId,
+            taskId: record.taskId,
+            workspaceId: task.workspaceId ?? null,
+            requiresDesktop: task.requiresDesktop ?? false,
+            title: task.title || null,
+            result: task.result ?? null,
+            error: task.error ?? null,
+            reason: 'Task requires user input to continue',
+            links: {
+              desktopTakeover: desktopTakeoverLink,
+            },
+          },
+        });
+
+    const stepTransitioned = isTemporal
+      ? false
+      : await this.transitionChecklistItemToBlockedWaitingUser(record, task.title, {
+          promptId: prompt.id,
+          promptKind: prompt.kind,
+          promptDedupeKey: prompt.dedupeKey,
+        });
     const phaseTransitioned = await this.transitionGoalRunToWaitingUserInput(record.goalRunId);
 
     await this.outboxService.enqueueOnce({
@@ -908,7 +938,8 @@ export class TaskDispatchService implements OnModuleInit {
         promptId: prompt.id,
         goalRunId: record.goalRunId,
         tenantId: goalRunTenant.tenantId,
-        checklistItemId: record.checklistItemId,
+        checklistItemId: isTemporal ? null : record.checklistItemId,
+        stepKey: isTemporal ? stepKey : null,
         taskId: record.taskId,
         kind: prompt.kind,
         stepDescription: task.title || null,
