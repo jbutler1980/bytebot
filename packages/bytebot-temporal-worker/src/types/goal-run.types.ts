@@ -29,6 +29,9 @@ export const GoalRunInputSchema = z.object({
     parentGoalRunId: z.string().optional(),
     inheritedKnowledge: z.array(z.string()).default([]),
   }).optional(),
+  // Runtime-only: allows starting a "capability probe" workflow execution that does not
+  // call activities or mutate external systems, but still validates Update handler registration.
+  mode: z.enum(['NORMAL', 'CAPABILITY_PROBE']).optional(),
 });
 
 export type GoalRunInput = z.infer<typeof GoalRunInputSchema>;
