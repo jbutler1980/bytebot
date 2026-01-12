@@ -60,6 +60,7 @@ import { GoalRunService, GoalRunPhase, GoalRunStatus } from './goal-run.service'
 import { PlannerService } from './planner.service';
 import { PlannerFirstStepUserInputError } from './planner.errors';
 import { GoalIntakeService } from './goal-intake.service';
+import { hasUserInteractionTool } from '../contracts/planner-tools';
 import { WorkflowService, WorkflowStatus, NodeStatus, WorkspaceProvisioningStatus } from './workflow.service';
 import { TaskDispatchService } from './task-dispatch.service';
 import { DbTransientService } from './db-transient.service';
@@ -877,7 +878,7 @@ export class OrchestratorLoopService implements OnModuleInit, OnModuleDestroy {
     // Prefer explicit step.type; fallback only on explicit machine flags (no NL matching).
     const isUserInputRequired =
       item.type === StepType.USER_INPUT_REQUIRED ||
-      (item.suggestedTools || []).includes('ASK_USER');
+      hasUserInteractionTool(item.suggestedTools);
 
     if (isUserInputRequired) {
       const kind =

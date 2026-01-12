@@ -1,6 +1,7 @@
 import { PlannerService } from './planner.service';
 import { StepType } from '@prisma/client';
 import { PlannerFirstStepUserInputError } from './planner.errors';
+import { ExecuteStepHasInteractionToolError, UnknownSuggestedToolTokenError } from '../contracts/planner-tools';
 
 describe('PlannerService no USER_INPUT_REQUIRED first step', () => {
   const makeService = () => {
@@ -77,7 +78,7 @@ describe('PlannerService no USER_INPUT_REQUIRED first step', () => {
     });
   });
 
-  it('rejects likely prompt-first output when description suggests asking the user but tools are missing', async () => {
+  it('rejects prompt-first output when step 1 is EXECUTE but has suggestedTools=["CHAT"]', async () => {
     const service = makeService();
 
     jest.spyOn(service as any, 'callLLM').mockResolvedValueOnce(
@@ -85,27 +86,29 @@ describe('PlannerService no USER_INPUT_REQUIRED first step', () => {
         summary: 'test',
         items: [
           {
-            description: 'Ask the user for required details',
+            description: 'Prompt the user to provide the missing inputs',
             type: StepType.EXECUTE,
+            expectedOutcome: 'Inputs provided',
+            suggestedTools: ['CHAT'],
+            requiresDesktop: false,
+          },
+          {
+            description: 'Proceed with task',
+            type: StepType.EXECUTE,
+            expectedOutcome: 'Task progressed',
             suggestedTools: [],
             requiresDesktop: false,
           },
-          ...Array.from({ length: 2 }).map((_, i) => ({
-            description: `Execute step ${i + 2}`,
-            type: StepType.EXECUTE,
-            suggestedTools: [],
-            requiresDesktop: false,
-          })),
         ],
         confidence: 0.9,
       }),
     );
 
-    const promise = (service as any).callLLMForPlan('Do stuff', {});
+    const promise = (service as any).callLLMForPlan('Do the thing', {});
     await expect(promise).rejects.toBeInstanceOf(PlannerFirstStepUserInputError);
 
     await promise.catch((error: PlannerFirstStepUserInputError) => {
-      expect(error.reason).toBe('LIKELY_USER_INPUT_DESCRIPTION');
+      expect(error.reason).toBe('ASK_USER_TOOL');
     });
   });
 
@@ -145,5 +148,64 @@ describe('PlannerService no USER_INPUT_REQUIRED first step', () => {
         undefined,
       ),
     ).rejects.toBeInstanceOf(PlannerFirstStepUserInputError);
+  });
+
+  it('rejects plan output when a non-first EXECUTE step contains an interaction tool token', async () => {
+    const service = makeService();
+    const llm = jest.spyOn(service as any, 'callLLM');
+
+    llm.mockResolvedValue(
+      JSON.stringify({
+        summary: 'test',
+        items: [
+          {
+            description: 'Do step 1',
+            type: StepType.EXECUTE,
+            expectedOutcome: 'Step 1 done',
+            suggestedTools: [],
+            requiresDesktop: false,
+          },
+          {
+            description: 'Ask the user for clarification',
+            type: StepType.EXECUTE, // misclassified
+            expectedOutcome: 'User clarified',
+            suggestedTools: ['ASK_USER'],
+            requiresDesktop: false,
+          },
+        ],
+        confidence: 0.9,
+      }),
+    );
+
+    await expect((service as any).callLLMForPlan('Do the thing', {})).rejects.toBeInstanceOf(
+      ExecuteStepHasInteractionToolError,
+    );
+    expect(llm).toHaveBeenCalled();
+  });
+
+  it('rejects plan output when suggestedTools contains an unknown tool token (fail-closed)', async () => {
+    const service = makeService();
+    const llm = jest.spyOn(service as any, 'callLLM');
+
+    llm.mockResolvedValue(
+      JSON.stringify({
+        summary: 'test',
+        items: [
+          {
+            description: 'Do step 1',
+            type: StepType.EXECUTE,
+            expectedOutcome: 'Step 1 done',
+            suggestedTools: ['totally_not_a_real_tool'],
+            requiresDesktop: false,
+          },
+        ],
+        confidence: 0.9,
+      }),
+    );
+
+    await expect((service as any).callLLMForPlan('Do the thing', {})).rejects.toBeInstanceOf(
+      UnknownSuggestedToolTokenError,
+    );
+    expect(llm).toHaveBeenCalled();
   });
 });
