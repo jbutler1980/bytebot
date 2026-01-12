@@ -564,6 +564,39 @@ export async function goalRunWorkflow(input: GoalRunInput): Promise<GoalRunResul
   });
 
   // ============================================================================
+  // Capability Probe Mode (Runtime rollout guardrail)
+  // ============================================================================
+
+  // This mode exists to let the orchestrator verify that:
+  // 1) the worker can run `goalRunWorkflow` on the target task queue, and
+  // 2) the `userPromptResolved` Update handler is registered and callable.
+  //
+  // In CAPABILITY_PROBE mode we intentionally avoid activities (no DB writes, no Kafka emits, no planning).
+  if (input.mode === 'CAPABILITY_PROBE') {
+    state.phase = 'WAITING_USER_INPUT' as GoalRunPhase;
+    state.isWaitingUserInput = true;
+    state.waitingUserInputReason = 'GOAL_INTAKE';
+    state.lastUpdatedAt = new Date().toISOString();
+
+    await condition(() => state.pendingUserPrompts.length > 0 || state.isCancelled);
+
+    const completedAt = new Date().toISOString();
+    const durationMs = Math.max(0, new Date(completedAt).getTime() - new Date(state.startedAt).getTime());
+
+    return {
+      goalRunId: input.goalRunId,
+      status: state.isCancelled ? 'CANCELLED' : 'COMPLETED',
+      completedAt,
+      summary: state.isCancelled ? 'CAPABILITY_PROBE_CANCELLED' : 'CAPABILITY_PROBE_OK',
+      stepsCompleted: 0,
+      totalDurationMs: durationMs,
+      finalOutcome: state.isCancelled ? state.cancelReason ?? undefined : undefined,
+      artifacts: [],
+      knowledgeGained: [],
+    };
+  }
+
+  // ============================================================================
   // Emit Start Event
   // ============================================================================
 
