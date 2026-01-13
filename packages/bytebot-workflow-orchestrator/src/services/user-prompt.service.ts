@@ -105,6 +105,11 @@ export class UserPromptService {
     goalRunId: string;
     goalSpecId: string;
     kind: UserPromptKind;
+    schemaId?: string | null;
+    schemaVersion?: number | null;
+    jsonSchema?: Prisma.InputJsonValue | null;
+    uiSchema?: Prisma.InputJsonValue | null;
+    validatorVersion?: string | null;
     payload: Prisma.InputJsonValue;
     expiresAt?: Date | null;
   }): Promise<UserPrompt> {
@@ -116,6 +121,11 @@ export class UserPromptService {
       goalSpecId: request.goalSpecId,
       kind: request.kind,
       scope: UserPromptScope.RUN,
+      schemaId: request.schemaId ?? null,
+      schemaVersion: request.schemaVersion ?? null,
+      jsonSchema: request.jsonSchema ?? null,
+      uiSchema: request.uiSchema ?? null,
+      validatorVersion: request.validatorVersion ?? null,
       payload: request.payload,
       dedupeKey,
       expiresAt: request.expiresAt ?? null,
@@ -229,6 +239,11 @@ export class UserPromptService {
     kind: UserPromptKind;
     dedupeKey: string;
     scope?: UserPromptScope;
+    schemaId?: string | null;
+    schemaVersion?: number | null;
+    jsonSchema?: Prisma.InputJsonValue | null;
+    uiSchema?: Prisma.InputJsonValue | null;
+    validatorVersion?: string | null;
     payload: Prisma.InputJsonValue;
     checklistItemId?: string | null;
     goalSpecId?: string | null;
@@ -290,6 +305,11 @@ export class UserPromptService {
                 scope,
                 status: UserPromptStatus.OPEN,
                 dedupeKey: request.dedupeKey,
+                schemaId: request.schemaId ?? null,
+                schemaVersion: request.schemaVersion ?? null,
+                jsonSchema: request.jsonSchema ?? Prisma.DbNull,
+                uiSchema: request.uiSchema ?? Prisma.DbNull,
+                validatorVersion: request.validatorVersion ?? null,
                 payload: request.payload,
                 expiresAt: request.expiresAt ?? null,
                 supersedesPromptId: existingOpen?.id ?? null,

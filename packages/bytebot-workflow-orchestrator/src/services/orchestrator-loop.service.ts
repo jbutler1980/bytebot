@@ -902,6 +902,7 @@ export class OrchestratorLoopService implements OnModuleInit, OnModuleDestroy {
         },
       });
 
+      const blockedAt = new Date();
       const stepBlocked = await this.prisma.checklistItem.updateMany({
         where: {
           id: item.id,
@@ -911,6 +912,9 @@ export class OrchestratorLoopService implements OnModuleInit, OnModuleDestroy {
         },
         data: {
           status: ChecklistItemStatus.BLOCKED,
+          blockedByPromptId: prompt.id,
+          blockedReason: 'INPUT_REQUIRED',
+          blockedAt,
           startedAt: item.startedAt ?? new Date(),
           completedAt: null,
           actualOutcome: JSON.stringify(
