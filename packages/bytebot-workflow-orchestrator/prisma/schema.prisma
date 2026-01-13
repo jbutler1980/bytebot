@@ -1490,6 +1490,11 @@ model GoalRun {
   workflowRunId String?      @unique @map("workflow_run_id")
   workflowRun   WorkflowRun? @relation(fields: [workflowRunId], references: [id])
 
+  // Temporal engine audit fields (nullable for LEGACY_DB_LOOP runs)
+  temporalWorkflowId String?   @map("temporal_workflow_id")
+  temporalRunId      String?   @map("temporal_run_id")
+  temporalStartedAt  DateTime? @map("temporal_started_at")
+
   // Current plan tracking
   currentPlanVersion Int @default(0) @map("current_plan_version")
 
@@ -1646,6 +1651,11 @@ model ChecklistItem {
   // Status
   status ChecklistItemStatus @default(PENDING)
 
+  // Durable blocked metadata (P0: restart-safe NEEDS_HELP / INPUT_REQUIRED handling)
+  blockedByPromptId String?   @map("blocked_by_prompt_id")
+  blockedReason     String?   @map("blocked_reason")
+  blockedAt         DateTime? @map("blocked_at")
+
   // Link to execution (item may create a WorkflowNode for execution)
   workflowNodeId String? @map("workflow_node_id")
 
@@ -1705,6 +1715,7 @@ model UserPrompt {
   // Content
   schemaId         String? @map("schema_id")
   schemaVersion    Int?    @map("schema_version")
+  jsonSchema       Json?   @map("json_schema")
   uiSchema         Json?   @map("ui_schema")
   validatorVersion String? @map("validator_version")
 

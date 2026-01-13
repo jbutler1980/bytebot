@@ -171,6 +171,11 @@ export class GoalIntakeService {
       goalRunId: request.goalRunId,
       goalSpecId: goalSpec.id,
       kind: UserPromptKind.GOAL_INTAKE,
+      schemaId: goalSpec.schemaId ?? defaults.schemaId,
+      schemaVersion: goalSpec.schemaVersion ?? defaults.schemaVersion,
+      jsonSchema: (goalSpec.jsonSchema ?? defaults.jsonSchema) as any,
+      uiSchema: (goalSpec.uiSchema ?? defaults.uiSchema) as any,
+      validatorVersion: 'ajv@8',
       payload: {
         kind: 'GOAL_INTAKE',
         goalRunId: request.goalRunId,
@@ -289,6 +294,11 @@ export class GoalIntakeService {
       goalRunId: request.goalRunId,
       goalSpecId: goalSpec.id,
       kind: UserPromptKind.GOAL_INTAKE,
+      schemaId,
+      schemaVersion,
+      jsonSchema: jsonSchema as any,
+      uiSchema: uiSchema as any,
+      validatorVersion: 'ajv@8',
       payload: {
         kind: 'GOAL_INTAKE',
         goalRunId: request.goalRunId,
