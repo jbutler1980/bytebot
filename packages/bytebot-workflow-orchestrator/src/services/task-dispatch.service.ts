@@ -32,6 +32,7 @@ import axios, { AxiosInstance } from 'axios';
 import {
   ChecklistItemStatus,
   ExecutionSurface,
+  GoalRunExecutionEngine,
   GoalRunPhase,
   UserPromptKind,
   UserPromptStatus,
@@ -380,11 +381,11 @@ export class TaskDispatchService implements OnModuleInit {
         highRiskTools: request.highRiskTools || [],
         gatewayToolsOnly: false,
         // Phase 4: Execution surface constraints - forward desktop requirement
-        requiresDesktop: request.requiresDesktop || false,
+        requiresDesktop: request.requiresDesktop ?? false,
         // PR5: ExecutionSurface propagation (end-to-end)
         executionSurface:
           request.executionSurface ??
-          ((request.requiresDesktop || false) ? ExecutionSurface.DESKTOP : ExecutionSurface.TEXT_ONLY),
+          ((request.requiresDesktop ?? false) ? ExecutionSurface.DESKTOP : ExecutionSurface.TEXT_ONLY),
         // v2.4.0: Context propagation for autonomous operation
         // Provides goal context and previous step results to help agent proceed without asking
         goalContext: request.goalContext,
@@ -852,8 +853,6 @@ export class TaskDispatchService implements OnModuleInit {
     // Side effects (activity, outbox) must happen once only, guarded by the durable transition.
     if (record.status === 'WAITING_USER') return;
 
-    this.logger.log(`Task ${record.taskId} needs user help for item ${record.checklistItemId}`);
-
     const promptKind = task.requiresDesktop
       ? UserPromptKind.DESKTOP_TAKEOVER
       : UserPromptKind.TEXT_CLARIFICATION;
@@ -866,38 +865,145 @@ export class TaskDispatchService implements OnModuleInit {
 
     const goalRunTenant = await this.prisma.goalRun.findUnique({
       where: { id: record.goalRunId },
-      select: { tenantId: true },
+      select: { tenantId: true, executionEngine: true },
     });
     if (!goalRunTenant?.tenantId) {
       throw new Error(`GoalRun ${record.goalRunId} not found (tenantId missing)`);
     }
 
-    const prompt = await this.userPromptService.ensureOpenPromptForStep({
-      tenantId: goalRunTenant.tenantId,
-      goalRunId: record.goalRunId,
-      checklistItemId: record.checklistItemId,
-      kind: promptKind,
-      payload: {
-        goalRunId: record.goalRunId,
-        checklistItemId: record.checklistItemId,
-        taskId: record.taskId,
-        workspaceId: task.workspaceId ?? null,
-        requiresDesktop: task.requiresDesktop ?? false,
-        title: task.title || null,
-        result: task.result ?? null,
-        error: task.error ?? null,
-        reason: 'Task requires user input to continue',
-        links: {
-          desktopTakeover: desktopTakeoverLink,
-        },
-      },
+    const isTemporal = goalRunTenant.executionEngine === GoalRunExecutionEngine.TEMPORAL_WORKFLOW;
+    const stepKey =
+      isTemporal && record.checklistItemId.startsWith(`${record.goalRunId}-`)
+        ? record.checklistItemId.slice(record.goalRunId.length + 1)
+        : record.checklistItemId;
+
+    // Durable idempotency (restart-safe):
+    // If an OPEN prompt already exists for this run+step+kind, treat NEEDS_HELP as already handled.
+    // This prevents repeated "needs help" logs/spam after process restarts (no in-memory dependency).
+    const promptDedupeKey = this.userPromptService.buildDedupeKey(
+      record.goalRunId,
+      stepKey,
+      promptKind,
+    );
+    const existingPrompt = await this.prisma.userPrompt.findUnique({
+      where: { dedupeKey: promptDedupeKey },
+      select: { id: true, status: true, kind: true, dedupeKey: true },
     });
 
-    const stepTransitioned = await this.transitionChecklistItemToBlockedWaitingUser(record, task.title, {
-      promptId: prompt.id,
-      promptKind: prompt.kind,
-      promptDedupeKey: prompt.dedupeKey,
-    });
+    if (existingPrompt?.status === UserPromptStatus.OPEN) {
+      // Best-effort: ensure legacy checklist item is durably marked BLOCKED and linked to the prompt.
+      // This enables operators to derive "already handled" entirely from DB state.
+      if (!isTemporal) {
+        await this.transitionChecklistItemToBlockedWaitingUser(record, task.title, {
+          promptId: existingPrompt.id,
+          promptKind: existingPrompt.kind,
+          promptDedupeKey: existingPrompt.dedupeKey,
+        });
+
+        try {
+          const existingItem = await this.prisma.checklistItem.findUnique({
+            where: { id: record.checklistItemId },
+            select: { status: true, blockedByPromptId: true },
+          });
+
+          if (existingItem?.status === ChecklistItemStatus.BLOCKED && !existingItem.blockedByPromptId) {
+            await this.prisma.checklistItem.updateMany({
+              where: { id: record.checklistItemId, blockedByPromptId: null },
+              data: {
+                blockedByPromptId: existingPrompt.id,
+                blockedReason: 'NEEDS_HELP',
+                blockedAt: new Date(),
+              },
+            });
+          }
+        } catch {
+          // ignore repair failures; we still stop spam via record.status
+        }
+      }
+
+      await this.transitionGoalRunToWaitingUserInput(record.goalRunId);
+
+      // Best-effort: ensure outbox notification exists (idempotent via dedupe key).
+      try {
+        await this.outboxService.enqueueOnce({
+          dedupeKey: existingPrompt.dedupeKey,
+          aggregateId: record.goalRunId,
+          eventType: 'user_prompt.created',
+          payload: {
+            promptId: existingPrompt.id,
+            goalRunId: record.goalRunId,
+            tenantId: goalRunTenant.tenantId,
+            checklistItemId: isTemporal ? null : record.checklistItemId,
+            stepKey: isTemporal ? stepKey : null,
+            taskId: record.taskId,
+            kind: existingPrompt.kind,
+            stepDescription: task.title || null,
+            links: {
+              desktopTakeover: desktopTakeoverLink,
+            },
+          },
+        });
+      } catch {
+        // ignore; outbox publisher/reconciler will retry later
+      }
+
+      // In-memory hotfix: stop per-poll spam immediately.
+      record.status = 'WAITING_USER';
+      this.dispatchRecords.set(record.idempotencyKey, record);
+      return;
+    }
+
+    this.logger.log(`Task ${record.taskId} needs user help for item ${record.checklistItemId}`);
+
+    const prompt = isTemporal
+      ? await this.userPromptService.ensureOpenPromptForStepKey({
+          tenantId: goalRunTenant.tenantId,
+          goalRunId: record.goalRunId,
+          stepKey,
+          kind: promptKind,
+          payload: {
+            goalRunId: record.goalRunId,
+            stepKey,
+            taskId: record.taskId,
+            workspaceId: task.workspaceId ?? null,
+            requiresDesktop: task.requiresDesktop ?? false,
+            title: task.title || null,
+            result: task.result ?? null,
+            error: task.error ?? null,
+            reason: 'Task requires user input to continue',
+            links: {
+              desktopTakeover: desktopTakeoverLink,
+            },
+          },
+        })
+      : await this.userPromptService.ensureOpenPromptForStep({
+          tenantId: goalRunTenant.tenantId,
+          goalRunId: record.goalRunId,
+          checklistItemId: record.checklistItemId,
+          kind: promptKind,
+          payload: {
+            goalRunId: record.goalRunId,
+            checklistItemId: record.checklistItemId,
+            taskId: record.taskId,
+            workspaceId: task.workspaceId ?? null,
+            requiresDesktop: task.requiresDesktop ?? false,
+            title: task.title || null,
+            result: task.result ?? null,
+            error: task.error ?? null,
+            reason: 'Task requires user input to continue',
+            links: {
+              desktopTakeover: desktopTakeoverLink,
+            },
+          },
+        });
+
+    const stepTransitioned = isTemporal
+      ? false
+      : await this.transitionChecklistItemToBlockedWaitingUser(record, task.title, {
+          promptId: prompt.id,
+          promptKind: prompt.kind,
+          promptDedupeKey: prompt.dedupeKey,
+        });
     const phaseTransitioned = await this.transitionGoalRunToWaitingUserInput(record.goalRunId);
 
     await this.outboxService.enqueueOnce({
@@ -908,7 +1014,8 @@ export class TaskDispatchService implements OnModuleInit {
         promptId: prompt.id,
         goalRunId: record.goalRunId,
         tenantId: goalRunTenant.tenantId,
-        checklistItemId: record.checklistItemId,
+        checklistItemId: isTemporal ? null : record.checklistItemId,
+        stepKey: isTemporal ? stepKey : null,
         taskId: record.taskId,
         kind: prompt.kind,
         stepDescription: task.title || null,
@@ -979,6 +1086,7 @@ export class TaskDispatchService implements OnModuleInit {
     title?: string,
     prompt?: { promptId: string; promptKind: string; promptDedupeKey: string },
   ): Promise<boolean> {
+    const blockedAt = new Date();
     const outcome = JSON.stringify(
       {
         blockedReason: 'WAITING_USER_INPUT',
@@ -1010,6 +1118,9 @@ export class TaskDispatchService implements OnModuleInit {
           },
           data: {
             status: ChecklistItemStatus.BLOCKED,
+            blockedByPromptId: prompt?.promptId ?? null,
+            blockedReason: 'NEEDS_HELP',
+            blockedAt,
             completedAt: null,
             actualOutcome: outcome,
           },

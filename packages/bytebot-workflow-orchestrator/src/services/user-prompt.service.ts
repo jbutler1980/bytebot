@@ -19,6 +19,19 @@ export interface EnsureOpenPromptForStepRequest {
   expiresAt?: Date | null;
 }
 
+export interface EnsureOpenPromptForStepKeyRequest {
+  tenantId: string;
+  goalRunId: string;
+  /**
+   * Stable, engine-agnostic step key (e.g., "step-1") used when no ChecklistItem row exists
+   * (e.g., TEMPORAL_WORKFLOW runs).
+   */
+  stepKey: string;
+  kind: UserPromptKind;
+  payload: Prisma.InputJsonValue;
+  expiresAt?: Date | null;
+}
+
 export interface ListUserPromptsRequest {
   tenantId: string;
   goalRunId?: string;
@@ -58,6 +71,25 @@ export class UserPromptService {
       goalRunId: request.goalRunId,
       checklistItemId: request.checklistItemId,
       kind: request.kind,
+      scope: UserPromptScope.STEP,
+      payload: request.payload,
+      dedupeKey,
+      expiresAt: request.expiresAt ?? null,
+    });
+  }
+
+  /**
+   * Create (or return existing) OPEN prompt for an engine-native step key (Temporal).
+   * This does not require a ChecklistItem row (avoids FK violations).
+   */
+  async ensureOpenPromptForStepKey(request: EnsureOpenPromptForStepKeyRequest): Promise<UserPrompt> {
+    const dedupeKey = this.buildDedupeKey(request.goalRunId, request.stepKey, request.kind);
+
+    return this.ensureOpenPrompt({
+      tenantId: request.tenantId,
+      goalRunId: request.goalRunId,
+      kind: request.kind,
+      scope: UserPromptScope.STEP,
       payload: request.payload,
       dedupeKey,
       expiresAt: request.expiresAt ?? null,
@@ -73,6 +105,11 @@ export class UserPromptService {
     goalRunId: string;
     goalSpecId: string;
     kind: UserPromptKind;
+    schemaId?: string | null;
+    schemaVersion?: number | null;
+    jsonSchema?: Prisma.InputJsonValue | null;
+    uiSchema?: Prisma.InputJsonValue | null;
+    validatorVersion?: string | null;
     payload: Prisma.InputJsonValue;
     expiresAt?: Date | null;
   }): Promise<UserPrompt> {
@@ -83,6 +120,12 @@ export class UserPromptService {
       goalRunId: request.goalRunId,
       goalSpecId: request.goalSpecId,
       kind: request.kind,
+      scope: UserPromptScope.RUN,
+      schemaId: request.schemaId ?? null,
+      schemaVersion: request.schemaVersion ?? null,
+      jsonSchema: request.jsonSchema ?? null,
+      uiSchema: request.uiSchema ?? null,
+      validatorVersion: request.validatorVersion ?? null,
       payload: request.payload,
       dedupeKey,
       expiresAt: request.expiresAt ?? null,
@@ -107,6 +150,7 @@ export class UserPromptService {
       goalRunId: request.goalRunId,
       approvalRequestId: request.approvalRequestId,
       kind: UserPromptKind.APPROVAL,
+      scope: UserPromptScope.APPROVAL,
       payload: request.payload,
       dedupeKey,
       expiresAt: request.expiresAt ?? null,
@@ -194,6 +238,12 @@ export class UserPromptService {
     goalRunId: string;
     kind: UserPromptKind;
     dedupeKey: string;
+    scope?: UserPromptScope;
+    schemaId?: string | null;
+    schemaVersion?: number | null;
+    jsonSchema?: Prisma.InputJsonValue | null;
+    uiSchema?: Prisma.InputJsonValue | null;
+    validatorVersion?: string | null;
     payload: Prisma.InputJsonValue;
     checklistItemId?: string | null;
     goalSpecId?: string | null;
@@ -203,7 +253,12 @@ export class UserPromptService {
   }): Promise<UserPrompt> {
     const maxAttempts = 3;
     const scope: UserPromptScope =
-      request.approvalRequestId ? UserPromptScope.APPROVAL : request.checklistItemId ? UserPromptScope.STEP : UserPromptScope.RUN;
+      request.scope ??
+      (request.approvalRequestId
+        ? UserPromptScope.APPROVAL
+        : request.checklistItemId
+          ? UserPromptScope.STEP
+          : UserPromptScope.RUN);
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const now = new Date();
@@ -250,6 +305,11 @@ export class UserPromptService {
                 scope,
                 status: UserPromptStatus.OPEN,
                 dedupeKey: request.dedupeKey,
+                schemaId: request.schemaId ?? null,
+                schemaVersion: request.schemaVersion ?? null,
+                jsonSchema: request.jsonSchema ?? Prisma.DbNull,
+                uiSchema: request.uiSchema ?? Prisma.DbNull,
+                validatorVersion: request.validatorVersion ?? null,
                 payload: request.payload,
                 expiresAt: request.expiresAt ?? null,
                 supersedesPromptId: existingOpen?.id ?? null,

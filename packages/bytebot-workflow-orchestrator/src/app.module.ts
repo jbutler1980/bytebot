@@ -53,16 +53,17 @@ import { TaskRecoveryService } from './services/task-recovery.service';
 import { WorkflowCheckpointService } from './services/workflow-checkpoint.service';
 import { DeadLetterQueueService } from './services/dead-letter-queue.service';
 // Phase 10: Manus-Style Goal-First Orchestration services
-import { GoalRunService } from './services/goal-run.service';
-import { PlannerService } from './services/planner.service';
-import { GoalIntakeService } from './services/goal-intake.service';
-import { OrchestratorLoopService } from './services/orchestrator-loop.service';
-import { UserPromptService } from './services/user-prompt.service';
-import { OutboxService } from './services/outbox.service';
-import { OutboxPublisherService } from './services/outbox-publisher.service';
-import { PromptResumeReconcilerService } from './services/prompt-resume-reconciler.service';
-import { InteractionSliMetricsService } from './services/interaction-sli-metrics.service';
-import { UserPromptResolutionService } from './services/user-prompt-resolution.service';
+	import { GoalRunService } from './services/goal-run.service';
+	import { PlannerService } from './services/planner.service';
+	import { GoalIntakeService } from './services/goal-intake.service';
+	import { OrchestratorLoopService } from './services/orchestrator-loop.service';
+	import { UserPromptService } from './services/user-prompt.service';
+	import { JsonSchemaValidatorService } from './services/json-schema-validator.service';
+	import { OutboxService } from './services/outbox.service';
+	import { OutboxPublisherService } from './services/outbox-publisher.service';
+	import { PromptResumeReconcilerService } from './services/prompt-resume-reconciler.service';
+	import { InteractionSliMetricsService } from './services/interaction-sli-metrics.service';
+	import { UserPromptResolutionService } from './services/user-prompt-resolution.service';
 // Phase 7 (v5.2.0): Enhanced Features - Templates, Batch Execution
 import { GoalTemplateService } from './services/goal-template.service';
 import { BatchService } from './services/batch.service';
@@ -274,14 +275,15 @@ import { MetricsModule } from './modules/metrics.module';
     DeadLetterQueueService,
     // Phase 10: Manus-Style Goal-First Orchestration
     GoalRunService,
-    PlannerService,
-    GoalIntakeService,
-    UserPromptService,
-    OutboxService,
-    OutboxPublisherService,
-    PromptResumeReconcilerService,
-    InteractionSliMetricsService,
-    UserPromptResolutionService,
+	    PlannerService,
+	    GoalIntakeService,
+	    UserPromptService,
+	    JsonSchemaValidatorService,
+	    OutboxService,
+	    OutboxPublisherService,
+	    PromptResumeReconcilerService,
+	    InteractionSliMetricsService,
+	    UserPromptResolutionService,
     // v5.5.18 Phase E: Maintenance mode (must be before orchestrator loop)
     MaintenanceModeService,
     // v5.8.0: Option C Industry Standard - Failure classification (must be before orchestrator loop)

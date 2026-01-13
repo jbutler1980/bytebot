@@ -46,7 +46,7 @@ import { PrismaService } from '../services/prisma.service';
 import { GoalIntakeService } from '../services/goal-intake.service';
 import { detectPlannerFirstStepUserInputReason, PlannerFirstStepUserInputError } from '../services/planner.errors';
 import { ExecutionSurface, StepType } from '@prisma/client';
-import { normalizeSuggestedToolsOrThrow } from '../contracts/planner-tools';
+import { normalizeSuggestedToolsOrThrow, PlannerOutputContractViolationError } from '../contracts/planner-tools';
 
 // ============================================================================
 // DTOs
@@ -315,6 +315,28 @@ export class InternalController {
     });
 
     try {
+      // Resolve execution surface deterministically (structured signals only; no NL heuristics).
+      // Temporal worker v1 StepDto may omit surface fields; use workspace presence as the safest default.
+      const resolvedExecutionSurface =
+        body.step.executionSurface ??
+        (typeof body.step.requiresDesktop === 'boolean'
+          ? body.step.requiresDesktop
+            ? ExecutionSurface.DESKTOP
+            : ExecutionSurface.TEXT_ONLY
+          : body.workspaceId
+            ? ExecutionSurface.DESKTOP
+            : ExecutionSurface.TEXT_ONLY);
+
+      const resolvedRequiresDesktop =
+        typeof body.step.requiresDesktop === 'boolean'
+          ? body.step.requiresDesktop
+          : resolvedExecutionSurface === ExecutionSurface.DESKTOP;
+
+      const normalizedSuggestedTools = normalizeSuggestedToolsOrThrow({
+        suggestedTools: body.step.suggestedTools,
+        allowedTools: null,
+      });
+
       // Get goal context for richer agent context
       const goalRun = await this.prisma.goalRun.findUnique({
         where: { id: body.goalRunId },
@@ -336,9 +358,9 @@ export class InternalController {
         title: body.step.description.slice(0, 100),
         description: body.step.description,
         expectedOutcome: body.step.expectedOutcome,
-        allowedTools: body.step.suggestedTools,
-        requiresDesktop: body.step.requiresDesktop,
-        executionSurface: body.step.executionSurface,
+        allowedTools: normalizedSuggestedTools,
+        requiresDesktop: resolvedRequiresDesktop,
+        executionSurface: resolvedExecutionSurface,
         // Context for autonomous operation
         goalContext: goalRun?.goal,
         previousStepResults,
@@ -622,100 +644,144 @@ Respond in JSON format:
         };
       }
 
-      // Build the planning prompt with proper granularity guidance
-      const planningPrompt = this.buildPlanningPrompt(body);
+      const basePrompt = this.buildPlanningPrompt(body);
+      const maxContractAttempts = 3;
 
-      // Phase 14.3: Call LLM directly via LiteLLM proxy
-      // Routes to gpt-oss-120b (120B parameter model) for high-quality planning
-      const responseText = await this.callLLM(planningPrompt, 4096, 0.3);
+      let lastContractError: PlannerOutputContractViolationError | null = null;
+      let parsed: any = null;
+      let steps: Array<{
+        stepNumber: number;
+        description: string;
+        expectedOutcome?: string;
+        isHighRisk: boolean;
+        dependencies: any[];
+        estimatedDurationMs?: number;
+      }> = [];
 
-      // Parse JSON response
-      let parsed: any;
-      try {
-        // Extract JSON from potential markdown code blocks
-        const jsonMatch = responseText.match(/```(?:json)?\s*([\s\S]*?)```/);
-        const jsonStr = jsonMatch ? jsonMatch[1] : responseText;
-        parsed = JSON.parse(jsonStr.trim());
-      } catch {
-        // Try to find JSON object in response
-        const objectMatch = responseText.match(/\{[\s\S]*\}/);
-        if (objectMatch) {
-          parsed = JSON.parse(objectMatch[0]);
-        } else {
-          throw new Error('Failed to parse LLM response as JSON');
+      for (let attempt = 1; attempt <= maxContractAttempts; attempt++) {
+        const planningPrompt =
+          attempt === 1
+            ? basePrompt
+            : `${basePrompt}\n\nCORRECTION REQUIRED:\n` +
+              `- Your previous JSON violated the planner-output contract.\n` +
+              `- suggestedTools MUST be either [] or a subset of the Allowed tools list. Never invent tool tokens.\n` +
+              `- If a step requires user input, use type=USER_INPUT_REQUIRED and suggestedTools=[\"ASK_USER\"] (never \"CHAT\").\n`;
+
+        // Phase 14.3: Call LLM directly via LiteLLM proxy
+        // Routes to gpt-oss-120b (120B parameter model) for high-quality planning
+        const responseText = await this.callLLM(planningPrompt, 4096, 0.3);
+
+        // Parse JSON response
+        let candidateParsed: any;
+        try {
+          // Extract JSON from potential markdown code blocks
+          const jsonMatch = responseText.match(/```(?:json)?\s*([\s\S]*?)```/);
+          const jsonStr = jsonMatch ? jsonMatch[1] : responseText;
+          candidateParsed = JSON.parse(jsonStr.trim());
+        } catch {
+          // Try to find JSON object in response
+          const objectMatch = responseText.match(/\{[\s\S]*\}/);
+          if (objectMatch) {
+            candidateParsed = JSON.parse(objectMatch[0]);
+          } else {
+            throw new Error('Failed to parse LLM response as JSON');
+          }
+        }
+
+        const rawSteps = Array.isArray(candidateParsed.steps) ? candidateParsed.steps : [];
+
+        try {
+          // Build a normalized representation so we can apply contract gates deterministically.
+          // We do not accept plans that contain interaction-shaped steps; those must be handled via Goal Intake.
+          type NormalizedPlannerChecklistItem = {
+            description: string;
+            type: StepType;
+            expectedOutcome?: string;
+            suggestedTools: string[];
+            requiresDesktop: boolean;
+            stepNumber: number;
+            isHighRisk: boolean;
+            dependencies: any[];
+            estimatedDurationMs?: number;
+          };
+
+          const normalizedChecklist: NormalizedPlannerChecklistItem[] = rawSteps.map((rawStep: any, index: number) => ({
+            description: typeof rawStep?.description === 'string' ? rawStep.description : '',
+            type: rawStep?.type === StepType.USER_INPUT_REQUIRED ? StepType.USER_INPUT_REQUIRED : StepType.EXECUTE,
+            expectedOutcome: typeof rawStep?.expectedOutcome === 'string' ? rawStep.expectedOutcome : undefined,
+            suggestedTools: normalizeSuggestedToolsOrThrow({
+              suggestedTools: Array.isArray(rawStep?.suggestedTools) ? rawStep.suggestedTools : [],
+              allowedTools: body.constraints?.allowedTools,
+            }),
+            requiresDesktop: typeof rawStep?.requiresDesktop === 'boolean' ? rawStep.requiresDesktop : false,
+            stepNumber: rawStep?.stepNumber ?? index + 1,
+            isHighRisk: rawStep?.isHighRisk ?? false,
+            dependencies: rawStep?.dependencies ?? [],
+            estimatedDurationMs: rawStep?.estimatedDurationMs,
+          }));
+
+          const firstInteraction = normalizedChecklist.find((item: NormalizedPlannerChecklistItem) =>
+            detectPlannerFirstStepUserInputReason(item),
+          );
+          if (firstInteraction) {
+            const reason = detectPlannerFirstStepUserInputReason(firstInteraction) ?? 'ASK_USER_TOOL';
+            const error = new PlannerFirstStepUserInputError({
+              mode: 'initial',
+              firstStep: firstInteraction,
+              reason,
+            });
+
+            const intake = await this.goalIntakeService.requestGoalIntakeFromPlannerError({
+              goalRunId: body.goalRunId,
+              tenantId: body.tenantId,
+              error,
+            });
+
+            this.logger.warn({
+              message: 'Planner produced an interaction-shaped step; issuing Goal Intake prompt instead',
+              goalRunId: body.goalRunId,
+              goalSpecId: intake.goalSpecId,
+              promptId: intake.promptId,
+              reason: error.reason,
+            });
+
+            return {
+              kind: 'GOAL_INTAKE_REQUIRED',
+              goalSpecId: intake.goalSpecId,
+              promptId: intake.promptId,
+              reason: error.reason,
+            };
+          }
+
+          steps = normalizedChecklist.map((item: NormalizedPlannerChecklistItem) => ({
+            stepNumber: item.stepNumber,
+            description: item.description,
+            expectedOutcome: item.expectedOutcome,
+            isHighRisk: item.isHighRisk ?? false,
+            dependencies: item.dependencies ?? [],
+            estimatedDurationMs: item.estimatedDurationMs,
+          }));
+
+          parsed = candidateParsed;
+          break;
+        } catch (error: any) {
+          if (error instanceof PlannerOutputContractViolationError) {
+            lastContractError = error;
+            this.logger.warn({
+              message: 'Planner output contract violation (retrying)',
+              goalRunId: body.goalRunId,
+              attempt,
+              code: error.code,
+            });
+            continue;
+          }
+          throw error;
         }
       }
 
-      const rawSteps = Array.isArray(parsed.steps) ? parsed.steps : [];
-
-      // Fail-closed planner output validation: unknown tool tokens cannot proceed.
-      // This is a contract boundary; do not rely on UI heuristics or NL matching.
-      for (const rawStep of rawSteps) {
-        normalizeSuggestedToolsOrThrow({
-          suggestedTools: Array.isArray(rawStep?.suggestedTools) ? rawStep.suggestedTools : [],
-          allowedTools: body.constraints?.allowedTools,
-        });
-      }
-
-      // Validate and normalize steps (Temporal workflow step schema)
-      const steps = rawSteps.map((step: any, index: number) => ({
-        stepNumber: step.stepNumber ?? index + 1,
-        description: step.description,
-        expectedOutcome: step.expectedOutcome,
-        isHighRisk: step.isHighRisk ?? false,
-        dependencies: step.dependencies ?? [],
-        estimatedDurationMs: step.estimatedDurationMs,
-      }));
-
-      // Safety net: if the model tries to start with an ask-user step, convert it into a Goal Intake prompt.
-      const firstRawStep = rawSteps[0];
-      const firstStepDescription =
-        typeof firstRawStep?.description === 'string'
-          ? firstRawStep.description
-          : typeof steps?.[0]?.description === 'string'
-            ? steps[0].description
-            : '';
-
-      const firstStep = {
-        description: firstStepDescription,
-        type: firstRawStep?.type === StepType.USER_INPUT_REQUIRED ? StepType.USER_INPUT_REQUIRED : StepType.EXECUTE,
-        expectedOutcome:
-          typeof firstRawStep?.expectedOutcome === 'string' ? firstRawStep.expectedOutcome : steps?.[0]?.expectedOutcome,
-        suggestedTools: normalizeSuggestedToolsOrThrow({
-          suggestedTools: Array.isArray(firstRawStep?.suggestedTools) ? firstRawStep.suggestedTools : [],
-          allowedTools: body.constraints?.allowedTools,
-        }),
-        requiresDesktop: typeof firstRawStep?.requiresDesktop === 'boolean' ? firstRawStep.requiresDesktop : false,
-      };
-
-      const promptFirstReason = firstStep.description ? detectPlannerFirstStepUserInputReason(firstStep) : null;
-      if (promptFirstReason) {
-        const error = new PlannerFirstStepUserInputError({
-          mode: 'initial',
-          firstStep,
-          reason: promptFirstReason,
-        });
-
-        const intake = await this.goalIntakeService.requestGoalIntakeFromPlannerError({
-          goalRunId: body.goalRunId,
-          tenantId: body.tenantId,
-          error,
-        });
-
-        this.logger.warn({
-          message: 'Planner produced a prompt-first plan; issuing Goal Intake prompt instead',
-          goalRunId: body.goalRunId,
-          goalSpecId: intake.goalSpecId,
-          promptId: intake.promptId,
-          reason: error.reason,
-        });
-
-        return {
-          kind: 'GOAL_INTAKE_REQUIRED',
-          goalSpecId: intake.goalSpecId,
-          promptId: intake.promptId,
-          reason: error.reason,
-        };
+      if (!parsed) {
+        if (lastContractError) throw lastContractError;
+        throw new Error('Failed to generate plan');
       }
 
       const durationMs = Date.now() - startTime;

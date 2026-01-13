@@ -12,6 +12,7 @@
  */
 
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { createId } from '@paralleldrive/cuid2';
 import { GoalRunPhase, GoalSpecStatus, UserPromptKind } from '@prisma/client';
@@ -26,6 +27,8 @@ import { PlannerFirstStepUserInputError } from './planner.errors';
 @Injectable()
 export class GoalIntakeService {
   private readonly logger = new Logger(GoalIntakeService.name);
+  private cachedForceTenantsRaw = '';
+  private cachedForceTenants = new Set<string>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -33,9 +36,30 @@ export class GoalIntakeService {
     private readonly outboxService: OutboxService,
     private readonly goalRunService: GoalRunService,
     private readonly eventEmitter: EventEmitter2,
+    private readonly configService: ConfigService,
     @InjectMetric('goal_intake_started_total')
     private readonly goalIntakeStartedTotal: Counter<string>,
   ) {}
+
+  private getForcedTenants(): Set<string> {
+    const raw = this.configService.get<string>('GOAL_INTAKE_FORCE_TENANTS', '');
+    if (raw === this.cachedForceTenantsRaw) return this.cachedForceTenants;
+
+    const parsed = new Set(
+      raw
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    );
+
+    this.cachedForceTenantsRaw = raw;
+    this.cachedForceTenants = parsed;
+    return parsed;
+  }
+
+  private shouldForceGoalIntakeForNewRun(tenantId: string): boolean {
+    return this.getForcedTenants().has(tenantId);
+  }
 
   private buildDefaultGoalSpecSchema(): {
     schemaId: string;
@@ -109,6 +133,9 @@ export class GoalIntakeService {
     });
 
     const defaults = this.buildDefaultGoalSpecSchema();
+    const initialStatus = this.shouldForceGoalIntakeForNewRun(goalRun.tenantId)
+      ? GoalSpecStatus.INCOMPLETE
+      : GoalSpecStatus.COMPLETE;
 
     const goalSpec =
       existingGoalSpec ??
@@ -117,7 +144,7 @@ export class GoalIntakeService {
           id: createId(),
           goalRunId: request.goalRunId,
           tenantId: request.tenantId,
-          status: GoalSpecStatus.COMPLETE,
+          status: initialStatus,
           schemaId: defaults.schemaId,
           schemaVersion: defaults.schemaVersion,
           jsonSchema: defaults.jsonSchema as any,
@@ -144,6 +171,11 @@ export class GoalIntakeService {
       goalRunId: request.goalRunId,
       goalSpecId: goalSpec.id,
       kind: UserPromptKind.GOAL_INTAKE,
+      schemaId: goalSpec.schemaId ?? defaults.schemaId,
+      schemaVersion: goalSpec.schemaVersion ?? defaults.schemaVersion,
+      jsonSchema: (goalSpec.jsonSchema ?? defaults.jsonSchema) as any,
+      uiSchema: (goalSpec.uiSchema ?? defaults.uiSchema) as any,
+      validatorVersion: 'ajv@8',
       payload: {
         kind: 'GOAL_INTAKE',
         goalRunId: request.goalRunId,
@@ -262,6 +294,11 @@ export class GoalIntakeService {
       goalRunId: request.goalRunId,
       goalSpecId: goalSpec.id,
       kind: UserPromptKind.GOAL_INTAKE,
+      schemaId,
+      schemaVersion,
+      jsonSchema: jsonSchema as any,
+      uiSchema: uiSchema as any,
+      validatorVersion: 'ajv@8',
       payload: {
         kind: 'GOAL_INTAKE',
         goalRunId: request.goalRunId,

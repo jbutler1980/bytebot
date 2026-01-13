@@ -2,10 +2,12 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  InternalServerErrorException,
   Injectable,
   Logger,
   NotFoundException,
   Optional,
+  UnprocessableEntityException,
 } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { createId } from '@paralleldrive/cuid2';
@@ -14,14 +16,17 @@ import {
   ChecklistItemStatus,
   GoalRunPhase,
   GoalSpecStatus,
+  Prisma,
   StepType,
   UserPromptKind,
+  UserPromptScope,
   UserPromptStatus,
 } from '@prisma/client';
 import { InjectMetric } from '@willsoto/nestjs-prometheus';
 import type { Counter, Histogram } from 'prom-client';
 import { PrismaService } from './prisma.service';
 import { AuditService, AuditEventType } from './audit.service';
+import { JsonSchemaValidatorService } from './json-schema-validator.service';
 
 @Injectable()
 export class UserPromptResolutionService {
@@ -30,6 +35,7 @@ export class UserPromptResolutionService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly eventEmitter: EventEmitter2,
+    private readonly jsonSchemaValidator: JsonSchemaValidatorService,
     @InjectMetric('user_prompt_time_to_resolve_seconds')
     private readonly userPromptTimeToResolveSeconds: Histogram<string>,
     @InjectMetric('prompt_resolved_total')
@@ -38,6 +44,12 @@ export class UserPromptResolutionService {
     private readonly goalIntakeCompletedTotal: Counter<string>,
     @InjectMetric('resume_outbox_enqueued_total')
     private readonly resumeOutboxEnqueuedTotal: Counter<string>,
+    @InjectMetric('user_prompt_resolution_validation_fail_total')
+    private readonly validationFailTotal: Counter<string>,
+    @InjectMetric('user_prompt_resolution_unauthorized_total')
+    private readonly unauthorizedTotal: Counter<string>,
+    @InjectMetric('user_prompt_resolution_incomplete_after_apply_total')
+    private readonly incompleteAfterApplyTotal: Counter<string>,
     @Optional() private readonly auditService?: AuditService,
   ) {}
 
@@ -132,6 +144,15 @@ export class UserPromptResolutionService {
     const resolvedAt = new Date();
 
     const result = await this.prisma.$transaction(async (tx) => {
+      // Lock the prompt row to ensure OPEN->RESOLVED is serialized across concurrent resolvers.
+      // This keeps derived updates (GoalSpec, outbox rows) single-writer and retry-safe.
+      const locked = await tx.$queryRaw<{ id: string }[]>(
+        Prisma.sql`SELECT id FROM workflow_orchestrator.user_prompts WHERE id = ${promptId} FOR UPDATE`,
+      );
+      if (!locked?.length) {
+        throw new NotFoundException(`UserPrompt ${promptId} not found`);
+      }
+
       const prompt = await tx.userPrompt.findUnique({ where: { id: promptId } });
 
       if (!prompt) {
@@ -152,6 +173,11 @@ export class UserPromptResolutionService {
 
       const authz = this.evaluateResolutionAuthz({ promptKind: prompt.kind, actorType: request.actor.type });
       if (!authz.allowed) {
+        try {
+          this.unauthorizedTotal.labels(prompt.kind, request.actor.type).inc();
+        } catch {
+          // ignore metric failures
+        }
         throw new ForbiddenException(authz.reason);
       }
 
@@ -163,43 +189,30 @@ export class UserPromptResolutionService {
         throw new ConflictException(`Prompt ${promptId} is not OPEN (status=${prompt.status})`);
       }
 
-      // Immutable resolution record (unique per promptId)
-      try {
-        await tx.userPromptResolution.create({
-          data: {
-            id: createId(),
-            promptId,
-            tenantId: promptTenantId,
-            goalRunId: prompt.goalRunId,
-            actorType: request.actor.type,
-            actorId: request.actor.id,
-            actorEmail: request.actor.email,
-            actorName: request.actor.name,
-            actorIpAddress: request.ipAddress,
-            actorUserAgent: request.userAgent,
-            requestId: request.requestId,
-            authContext: request.actor.authContext ?? {},
-            clientRequestId: request.clientRequestId,
-            idempotencyKey: request.idempotencyKey,
-            authzDecision: 'ALLOW',
-            authzPolicy: authz.policy,
-            authzRuleId: authz.ruleId,
-            authzReason: authz.reason,
-            answers: request.answers,
-          },
-        });
-      } catch (error: any) {
-        if (error?.code !== 'P2002') throw error;
+      // Validate answers against the prompt's schema snapshot (fail-closed).
+      // - Patch validation: validate only provided fields (no required enforcement)
+      // - Full validation: validate merged state to prove completeness before resolving
+      const hasSchemaSnapshot = prompt.jsonSchema != null;
+      if (prompt.kind === UserPromptKind.GOAL_INTAKE && !hasSchemaSnapshot) {
+        throw new InternalServerErrorException('GOAL_INTAKE prompt is missing json_schema snapshot');
       }
 
-      const updatedPrompt = await tx.userPrompt.update({
-        where: { id: promptId },
-        data: {
-          status: UserPromptStatus.RESOLVED,
-          answers: request.answers,
-          resolvedAt,
-        },
-      });
+      if (hasSchemaSnapshot) {
+        const patchSchema = this.jsonSchemaValidator.makePatchSchema(prompt.jsonSchema as any);
+        const patchResult = this.jsonSchemaValidator.validate(patchSchema as any, request.answers);
+        if (!patchResult.valid) {
+          try {
+            this.validationFailTotal.labels(prompt.kind, prompt.scope).inc();
+          } catch {
+            // ignore metric failures
+          }
+          throw new UnprocessableEntityException({
+            code: 'VALIDATION_FAILED',
+            message: 'answers failed JSON schema validation',
+            details: patchResult.violations,
+          });
+        }
+      }
 
       let checklistItemDescription: string | null = null;
 
@@ -255,7 +268,7 @@ export class UserPromptResolutionService {
       if (prompt.goalSpecId) {
         const goalSpec = await tx.goalSpec.findUnique({
           where: { id: prompt.goalSpecId },
-          select: { values: true },
+          select: { values: true, status: true },
         });
 
         const mergedValues = {
@@ -263,8 +276,37 @@ export class UserPromptResolutionService {
           ...(request.answers as any),
         };
 
-        // v1: treat resolution as completing intake; if validation finds missing fields later,
-        // the system issues a follow-up prompt revision rather than mutating history.
+        // Full validation: completeness is proven against the prompt's schema snapshot.
+        // If incomplete, keep prompt OPEN and keep GoalSpec INCOMPLETE (no false RESOLVED).
+        if (prompt.kind === UserPromptKind.GOAL_INTAKE) {
+          const fullResult = this.jsonSchemaValidator.validate(prompt.jsonSchema as any, mergedValues);
+          if (!fullResult.valid) {
+            try {
+              this.incompleteAfterApplyTotal.labels(prompt.kind).inc();
+            } catch {
+              // ignore metric failures
+            }
+
+            // Persist partial progress, but keep GoalSpec INCOMPLETE and do not resolve the prompt.
+            await tx.goalSpec.update({
+              where: { id: prompt.goalSpecId },
+              data: {
+                values: mergedValues,
+                status: GoalSpecStatus.INCOMPLETE,
+                completedAt: null,
+              },
+            });
+
+            throw new ConflictException({
+              code: 'INCOMPLETE_AFTER_APPLY',
+              message: 'GoalSpec is still incomplete after applying answers',
+              missingFields: fullResult.missingFields,
+              details: fullResult.violations,
+            });
+          }
+        }
+
+        // GoalSpec is complete (or this is a non-intake prompt linked to GoalSpec).
         await tx.goalSpec.update({
           where: { id: prompt.goalSpecId },
           data: {
@@ -274,6 +316,56 @@ export class UserPromptResolutionService {
           },
         });
       }
+
+      // Resolution record is written only on success (idempotency keys consumed only on success).
+      // Immutable resolution record (unique per promptId)
+      try {
+        await tx.userPromptResolution.create({
+          data: {
+            id: createId(),
+            promptId,
+            tenantId: promptTenantId,
+            goalRunId: prompt.goalRunId,
+            actorType: request.actor.type,
+            actorId: request.actor.id,
+            actorEmail: request.actor.email,
+            actorName: request.actor.name,
+            actorIpAddress: request.ipAddress,
+            actorUserAgent: request.userAgent,
+            requestId: request.requestId,
+            authContext: request.actor.authContext ?? {},
+            clientRequestId: request.clientRequestId,
+            idempotencyKey: request.idempotencyKey,
+            authzDecision: 'ALLOW',
+            authzPolicy: authz.policy,
+            authzRuleId: authz.ruleId,
+            authzReason: authz.reason,
+            answers: request.answers,
+          },
+        });
+      } catch (error: any) {
+        if (error?.code !== 'P2002') throw error;
+      }
+
+      const updatedCount = await tx.userPrompt.updateMany({
+        where: { id: promptId, status: UserPromptStatus.OPEN },
+        data: {
+          status: UserPromptStatus.RESOLVED,
+          answers: request.answers,
+          resolvedAt,
+        },
+      });
+
+      if (updatedCount.count === 0) {
+        const current = await tx.userPrompt.findUnique({ where: { id: promptId } });
+        if (current?.status === UserPromptStatus.RESOLVED) {
+          return { prompt: current, didResolve: false, phaseChanged: false, previousPhase: null as GoalRunPhase | null };
+        }
+        throw new ConflictException(`Prompt ${promptId} could not be resolved (status changed concurrently)`);
+      }
+
+      const updatedPrompt = await tx.userPrompt.findUnique({ where: { id: promptId } });
+      if (!updatedPrompt) throw new NotFoundException(`UserPrompt ${promptId} not found after resolve`);
 
       const goalRun = await tx.goalRun.findUnique({
         where: { id: prompt.goalRunId },

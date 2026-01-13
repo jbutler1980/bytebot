@@ -429,6 +429,23 @@ import { PrometheusModule, makeCounterProvider, makeGaugeProvider, makeHistogram
       labelNames: ['actor_type', 'kind'],
     }),
 
+    // Counter: Prompt resolution failures (fail-closed)
+    makeCounterProvider({
+      name: 'user_prompt_resolution_validation_fail_total',
+      help: 'Total prompt resolution attempts rejected by JSON schema validation',
+      labelNames: ['kind', 'scope'],
+    }),
+    makeCounterProvider({
+      name: 'user_prompt_resolution_unauthorized_total',
+      help: 'Total prompt resolution attempts rejected by authorization policy',
+      labelNames: ['kind', 'actor_type'],
+    }),
+    makeCounterProvider({
+      name: 'user_prompt_resolution_incomplete_after_apply_total',
+      help: 'Total prompt resolution attempts where answers applied but derived completeness still failed',
+      labelNames: ['kind'],
+    }),
+
     // Counter: Resume outbox enqueued (resolution vs reconciler repair)
     makeCounterProvider({
       name: 'resume_outbox_enqueued_total',
@@ -484,6 +501,9 @@ import { PrometheusModule, makeCounterProvider, makeGaugeProvider, makeHistogram
     'PROM_METRIC_GOAL_INTAKE_STARTED_TOTAL',
     'PROM_METRIC_GOAL_INTAKE_COMPLETED_TOTAL',
     'PROM_METRIC_PROMPT_RESOLVED_TOTAL',
+    'PROM_METRIC_USER_PROMPT_RESOLUTION_VALIDATION_FAIL_TOTAL',
+    'PROM_METRIC_USER_PROMPT_RESOLUTION_UNAUTHORIZED_TOTAL',
+    'PROM_METRIC_USER_PROMPT_RESOLUTION_INCOMPLETE_AFTER_APPLY_TOTAL',
     'PROM_METRIC_RESUME_OUTBOX_ENQUEUED_TOTAL',
     'PROM_METRIC_RESUME_UPDATE_SUCCESS_TOTAL',
     'PROM_METRIC_RESUME_UPDATE_FAILED_TOTAL',

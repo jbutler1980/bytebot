@@ -66,7 +66,10 @@ describe('GoalRunService execution_engine (immutable per-run engine)', () => {
 
     const workflowService = {} as any;
     const eventEmitter = { emit: jest.fn() } as any;
-    const temporalWorkflowService = { isEnabled: jest.fn().mockReturnValue(true) } as any;
+    const temporalWorkflowService = {
+      isEnabled: jest.fn().mockReturnValue(true),
+      getWorkflowId: jest.fn((goalRunId: string) => `goal-run-${goalRunId}`),
+    } as any;
     const featureFlagService = {
       shouldUseTemporalWorkflow: jest.fn().mockReturnValue({ enabled: true, reason: 'test' }),
     } as any;
@@ -102,6 +105,7 @@ describe('GoalRunService execution_engine (immutable per-run engine)', () => {
       expect.objectContaining({
         data: expect.objectContaining({
           executionEngine: GoalRunExecutionEngine.TEMPORAL_WORKFLOW,
+          temporalWorkflowId: expect.stringMatching(/^goal-run-gr-/),
         }),
       }),
     );
@@ -170,6 +174,7 @@ describe('GoalRunService execution_engine (immutable per-run engine)', () => {
       goalRun: {
         findUnique: jest.fn(),
         update: jest.fn(),
+        updateMany: jest.fn(),
       },
       activityEvent: {
         create: jest.fn(),
@@ -206,6 +211,7 @@ describe('GoalRunService execution_engine (immutable per-run engine)', () => {
       startedAt: new Date(),
       completedAt: null,
     });
+    prisma.goalRun.updateMany.mockResolvedValueOnce({ count: 1 });
 
     const service = new GoalRunService(
       prisma,
@@ -219,7 +225,12 @@ describe('GoalRunService execution_engine (immutable per-run engine)', () => {
 
     expect(featureFlagService.shouldUseTemporalWorkflow).not.toHaveBeenCalled();
     expect(temporalWorkflowService.startGoalRunWorkflow).toHaveBeenCalledTimes(1);
+    expect(prisma.goalRun.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 'gr-1' }),
+        data: expect.objectContaining({ temporalWorkflowId: 'wf-1', temporalRunId: 'wr-1' }),
+      }),
+    );
     expect(eventEmitter.emit).not.toHaveBeenCalledWith('goal-run.started', expect.anything());
   });
 });
-

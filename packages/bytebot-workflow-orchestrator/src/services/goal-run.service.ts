@@ -73,6 +73,9 @@ export interface GoalRunResponse {
   status: GoalRunStatus;
   executionEngine: GoalRunExecutionEngine;
   workflowRunId?: string | null;
+  temporalWorkflowId?: string | null;
+  temporalRunId?: string | null;
+  temporalStartedAt?: Date | null;
   currentPlanVersion: number;
   error?: string | null;
   createdAt: Date;
@@ -191,6 +194,11 @@ export class GoalRunService {
       ? GoalRunExecutionEngine.TEMPORAL_WORKFLOW
       : GoalRunExecutionEngine.LEGACY_DB_LOOP;
 
+    const temporalWorkflowId =
+      executionEngine === GoalRunExecutionEngine.TEMPORAL_WORKFLOW && this.temporalWorkflowService
+        ? this.temporalWorkflowService.getWorkflowId(goalRunId)
+        : null;
+
     const goalRun = await this.prisma.goalRun.create({
       data: {
         id: goalRunId,
@@ -201,6 +209,7 @@ export class GoalRunService {
         status: GoalRunStatus.PENDING,
         currentPlanVersion: 0,
         executionEngine,
+        ...(temporalWorkflowId ? { temporalWorkflowId } : {}),
       },
     });
 
@@ -379,6 +388,12 @@ export class GoalRunService {
 
     // Start Temporal workflow if engine is pinned to TEMPORAL_WORKFLOW
     if (executionEngine === GoalRunExecutionEngine.TEMPORAL_WORKFLOW && this.temporalWorkflowService) {
+      // Idempotency: if we already recorded Temporal workflow identifiers, do not start a second workflow.
+      if (existingGoalRun.temporalStartedAt || existingGoalRun.temporalRunId) {
+        this.logger.log(
+          `Temporal workflow already started for ${goalRunId}: ${existingGoalRun.temporalWorkflowId ?? this.temporalWorkflowService.getWorkflowId(goalRunId)} (run: ${existingGoalRun.temporalRunId ?? 'unknown'})`,
+        );
+      } else {
       try {
         const constraints = goalRun.constraints as GoalConstraints;
         const { workflowId, runId } = await this.temporalWorkflowService.startGoalRunWorkflow({
@@ -396,6 +411,24 @@ export class GoalRunService {
         });
 
         this.logger.log(`Temporal workflow started: ${workflowId} (run: ${runId})`);
+
+        // Persist Temporal identifiers for audit/debug (write-once semantics).
+        const temporalStartedAt = new Date();
+        await this.prisma.goalRun.updateMany({
+          where: {
+            id: goalRunId,
+            temporalRunId: null,
+          },
+          data: {
+            temporalWorkflowId: workflowId,
+            temporalRunId: runId,
+            temporalStartedAt,
+          },
+        });
+
+        (goalRun as any).temporalWorkflowId = workflowId;
+        (goalRun as any).temporalRunId = runId;
+        (goalRun as any).temporalStartedAt = temporalStartedAt;
 
         // Note: Do NOT set workflowRunId here. That field references the legacy
         // workflow_runs table (FK constraint), but Temporal workflows don't create
@@ -429,6 +462,7 @@ export class GoalRunService {
         });
 
         return this.toGoalRunResponse(failed);
+      }
       }
     }
 
@@ -1176,6 +1210,9 @@ export class GoalRunService {
       executionEngine:
         goalRun.executionEngine ?? GoalRunExecutionEngine.LEGACY_DB_LOOP,
       workflowRunId: goalRun.workflowRunId,
+      temporalWorkflowId: goalRun.temporalWorkflowId ?? null,
+      temporalRunId: goalRun.temporalRunId ?? null,
+      temporalStartedAt: goalRun.temporalStartedAt ?? null,
       currentPlanVersion: goalRun.currentPlanVersion,
       error: goalRun.error,
       createdAt: goalRun.createdAt,
