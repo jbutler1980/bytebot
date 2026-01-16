@@ -31,15 +31,16 @@ import {
   isUserActionContentBlock,
   isComputerToolUseContentBlock,
   isImageContentBlock,
-  ThinkingContentBlock,
 } from '@bytebot/shared';
 import { Message, Role } from '@prisma/client';
 import { proxyTools } from './proxy.tools';
 import {
   BytebotAgentService,
+  BytebotAgentGenerateMessageOptions,
   BytebotAgentInterrupt,
   BytebotAgentResponse,
 } from '../agent/agent.types';
+import { filterToolsByPolicy } from '../agent/tool-policy';
 
 @Injectable()
 export class ProxyService implements BytebotAgentService {
@@ -49,6 +50,13 @@ export class ProxyService implements BytebotAgentService {
   private readonly desktopVisionProxyEndpoints: string[];
   private readonly defaultMaxImageBlocks: number;
   private readonly desktopVisionMaxImageBlocks: number;
+  private readonly endpointPreflightEnabled: boolean;
+  private readonly endpointPreflightTimeoutMs: number;
+  private readonly endpointPreflightTtlMs: number;
+  private readonly endpointPreflightCache = new Map<
+    string,
+    { ok: boolean; checkedAt: number }
+  >();
   private readonly openaiClientsByBaseUrl = new Map<string, OpenAI>();
 
   constructor(
@@ -82,6 +90,33 @@ export class ProxyService implements BytebotAgentService {
       ) || 0,
     );
 
+    this.endpointPreflightEnabled = this.parseBooleanEnv(
+      this.configService.get<string>('BYTEBOT_LLM_PROXY_ENDPOINT_PREFLIGHT_ENABLED'),
+      true,
+    );
+    this.endpointPreflightTimeoutMs = Math.max(
+      100,
+      parseInt(
+        (
+          this.configService.get<string>(
+            'BYTEBOT_LLM_PROXY_ENDPOINT_PREFLIGHT_TIMEOUT_MS',
+          ) || '2000'
+        ).trim(),
+        10,
+      ) || 0,
+    );
+    this.endpointPreflightTtlMs = Math.max(
+      0,
+      parseInt(
+        (
+          this.configService.get<string>(
+            'BYTEBOT_LLM_PROXY_ENDPOINT_PREFLIGHT_TTL_MS',
+          ) || '5000'
+        ).trim(),
+        10,
+      ) || 0,
+    );
+
     if (this.defaultProxyEndpoints.length === 0) {
       this.logger.warn(
         'BYTEBOT_LLM_PROXY_URL is not set. ProxyService will not work properly.',
@@ -105,8 +140,112 @@ export class ProxyService implements BytebotAgentService {
     return unique.length > 0 ? unique : null;
   }
 
+  private parseBooleanEnv(value: string | undefined, defaultValue: boolean): boolean {
+    if (value == null) return defaultValue;
+    const normalized = value.trim().toLowerCase();
+    if (normalized === '') return defaultValue;
+    if (['1', 'true', 'yes', 'y', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'n', 'off'].includes(normalized)) return false;
+    return defaultValue;
+  }
+
   private normalizeBaseUrl(baseUrl: string): string {
     return baseUrl.replace(/\/+$/, '');
+  }
+
+  protected async preflightEndpoint(
+    baseUrl: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (!this.endpointPreflightEnabled) return true;
+
+    const normalized = this.normalizeBaseUrl(baseUrl);
+    const key = this.endpointKey(normalized);
+    const now = Date.now();
+
+    const cached = this.endpointPreflightCache.get(key);
+    if (cached && now - cached.checkedAt < this.endpointPreflightTtlMs) {
+      return cached.ok;
+    }
+
+    // Some callers set baseUrl to ".../v1". Health endpoints live on the root.
+    const healthBase = normalized.replace(/\/v1$/, '');
+    const url = `${healthBase}/health/readiness`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.endpointPreflightTimeoutMs);
+
+    const abortFromUpstream = () => controller.abort();
+    signal?.addEventListener('abort', abortFromUpstream, { once: true });
+
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: this.proxyApiKey
+          ? { Authorization: `Bearer ${this.proxyApiKey}` }
+          : undefined,
+        signal: controller.signal,
+      });
+      const ok = response.ok;
+      this.endpointPreflightCache.set(key, { ok, checkedAt: now });
+      return ok;
+    } catch {
+      this.endpointPreflightCache.set(key, { ok: false, checkedAt: now });
+      return false;
+    } finally {
+      clearTimeout(timeoutId);
+      signal?.removeEventListener('abort', abortFromUpstream);
+    }
+  }
+
+  private sanitizeChatMessages(
+    messages: ChatCompletionMessageParam[],
+  ): ChatCompletionMessageParam[] {
+    const sanitized: ChatCompletionMessageParam[] = [];
+    const seenToolCallIds = new Set<string>();
+
+    for (const message of messages) {
+      if (message.role === 'assistant') {
+        const maybeToolCalls = (message as any).tool_calls as unknown;
+        const toolCalls = Array.isArray(maybeToolCalls) ? maybeToolCalls : [];
+
+        for (const toolCall of toolCalls) {
+          if (toolCall && typeof toolCall.id === 'string' && toolCall.id.trim() !== '') {
+            seenToolCallIds.add(toolCall.id);
+          }
+        }
+
+        const content = (message as any).content as unknown;
+        const hasContent =
+          typeof content === 'string'
+            ? content.trim().length > 0
+            : Array.isArray(content)
+              ? content.length > 0
+              : content != null;
+        const hasToolCalls = toolCalls.length > 0;
+
+        if (!hasContent && !hasToolCalls) continue;
+        sanitized.push(message);
+        continue;
+      }
+
+      if (message.role === 'tool') {
+        const toolCallId = (message as any).tool_call_id as unknown;
+        if (
+          typeof toolCallId === 'string' &&
+          toolCallId.trim() !== '' &&
+          !seenToolCallIds.has(toolCallId)
+        ) {
+          continue;
+        }
+        sanitized.push(message);
+        continue;
+      }
+
+      sanitized.push(message);
+    }
+
+    return sanitized;
   }
 
   private isDesktopVisionRequestedModel(model: string): boolean {
@@ -176,15 +315,17 @@ export class ProxyService implements BytebotAgentService {
     systemPrompt: string,
     messages: Message[],
     model: string,
-    useTools: boolean = true,
-    signal?: AbortSignal,
+    options: BytebotAgentGenerateMessageOptions = {},
   ): Promise<BytebotAgentResponse> {
+    const useTools = options.useTools ?? true;
+    const signal = options.signal;
+
     // Convert messages to Chat Completion format
-    const chatMessages = this.formatMessagesForChatCompletion(
+    const chatMessages = this.sanitizeChatMessages(this.formatMessagesForChatCompletion(
       systemPrompt,
       messages,
       model,
-    );
+    ));
 
     // Determine if model supports reasoning_effort parameter
     // Only OpenAI o-series models (o1, o3, etc.) support this
@@ -192,11 +333,19 @@ export class ProxyService implements BytebotAgentService {
     const isReasoning = this.isReasoningModel(model);
 
     // Prepare the Chat Completion request
+    const tools = useTools
+      ? filterToolsByPolicy(
+          proxyTools,
+          (tool) => tool.function.name,
+          options.toolPolicy,
+        )
+      : [];
+
     const completionRequest: OpenAI.Chat.ChatCompletionCreateParams = {
       model,
       messages: chatMessages,
       max_tokens: 8192,
-      ...(useTools && { tools: proxyTools }),
+      ...(tools.length > 0 && { tools }),
       // Only include reasoning_effort for o-series models
       // Non-reasoning models (Claude, GPT-4, etc.) don't support this parameter
       ...(isReasoning && { reasoning_effort: 'high' }),
@@ -211,8 +360,50 @@ export class ProxyService implements BytebotAgentService {
       const key = this.endpointKey(baseUrl);
       attemptedEndpointKeys.push(key);
 
-      const openai = this.getOpenAIClient(baseUrl);
       const callStart = Date.now();
+      const hasFallbackEndpoint = i < endpoints.length - 1;
+
+      // Fast endpoint preflight to avoid OS-level TCP connect hangs (50s+ blackholes).
+      // If the endpoint is not reachable/readiness-failing, fail over immediately.
+      if (endpoints.length > 1) {
+        const ok = await this.preflightEndpoint(baseUrl, signal);
+        if (!ok) {
+          const errorType = LLMErrorType.NETWORK;
+          const errorMessage = `Endpoint preflight failed for ${key}`;
+
+          lastFailure = {
+            errorType,
+            errorMessage,
+            attempts: 0,
+            durationMs: Date.now() - callStart,
+          };
+
+          this.llmResilienceService.openCircuit(key, {
+            type: errorType,
+            message: errorMessage,
+            retryable: true,
+            originalError: new Error(errorMessage),
+          });
+
+          if (hasFallbackEndpoint) {
+            const nextKey = this.endpointKey(endpoints[i + 1]);
+            this.eventEmitter.emit('llm.endpoint.failover', {
+              fromEndpoint: key,
+              toEndpoint: nextKey,
+              reason: errorType,
+              requestedModel: model,
+            });
+            this.logger.warn(
+              `LLM endpoint preflight failed (${key}); failing over to ${nextKey}`,
+            );
+            continue;
+          }
+
+          break;
+        }
+      }
+
+      const openai = this.getOpenAIClient(baseUrl);
 
       // v2.5.0+: Wrap API call with retry logic (maxRetries=0 per-endpoint; failover happens at the endpoint layer).
       const result = await this.llmResilienceService.executeWithRetry(
@@ -254,22 +445,64 @@ export class ProxyService implements BytebotAgentService {
         }
 
         // Process the response
-        const choice = completion.choices[0];
-        if (!choice || !choice.message) {
-          throw new Error('No valid response from Chat Completion API');
+        try {
+          const choice = completion.choices?.[0];
+          if (!choice || !choice.message) {
+            throw new Error('No valid message in Chat Completion response');
+          }
+
+          // Convert response to MessageContentBlocks
+          const contentBlocks = this.formatChatCompletionResponse(choice.message);
+          if (contentBlocks.length === 0) {
+            throw new Error('Chat Completion response contained no usable content blocks');
+          }
+
+          return {
+            contentBlocks,
+            tokenUsage: {
+              inputTokens: completion.usage?.prompt_tokens || 0,
+              outputTokens: completion.usage?.completion_tokens || 0,
+              totalTokens: completion.usage?.total_tokens || 0,
+            },
+          };
+        } catch (error: any) {
+          const errorType = LLMErrorType.SERVER_ERROR;
+          const errorMessage = error?.message || 'Invalid Chat Completion response';
+
+          lastFailure = {
+            errorType,
+            errorMessage,
+            attempts: result.attempts,
+            durationMs: result.totalDurationMs,
+          };
+
+          const hasNextEndpoint = i < endpoints.length - 1;
+          if (hasNextEndpoint) {
+            // Treat invalid/empty responses as INFRA: open circuit and fail over to next endpoint.
+            this.llmResilienceService.openCircuit(key, {
+              type: errorType,
+              message: errorMessage,
+              retryable: true,
+              originalError: error instanceof Error ? error : undefined,
+            });
+
+            const nextKey = this.endpointKey(endpoints[i + 1]);
+            this.eventEmitter.emit('llm.endpoint.failover', {
+              fromEndpoint: key,
+              toEndpoint: nextKey,
+              reason: errorType,
+              requestedModel: model,
+            });
+
+            this.logger.warn(
+              `LLM endpoint returned invalid response [${errorType}] (${key}); failing over to ${nextKey}`,
+            );
+            continue;
+          }
+
+          // No fallback endpoint available
+          break;
         }
-
-        // Convert response to MessageContentBlocks
-        const contentBlocks = this.formatChatCompletionResponse(choice.message);
-
-        return {
-          contentBlocks,
-          tokenUsage: {
-            inputTokens: completion.usage?.prompt_tokens || 0,
-            outputTokens: completion.usage?.completion_tokens || 0,
-            totalTokens: completion.usage?.total_tokens || 0,
-          },
-        };
       }
 
       const errorType = result.error?.type || 'UNKNOWN';
@@ -434,13 +667,8 @@ export class ProxyService implements BytebotAgentService {
               break;
             }
             case MessageContentType.Thinking: {
-              const thinkingBlock = block as ThinkingContentBlock;
-              const message: ChatCompletionMessageParam = {
-                role: 'assistant',
-                content: null,
-              };
-              message['reasoning_content'] = thinkingBlock.thinking;
-              chatMessages.push(message);
+              // Do not replay thinking-only blocks back into the LLM context.
+              // Some OpenAI-compatible servers reject assistant messages without `content` or `tool_calls`.
               break;
             }
             case MessageContentType.ToolResult: {
@@ -552,14 +780,6 @@ export class ProxyService implements BytebotAgentService {
         type: MessageContentType.Text,
         text: message.content,
       } as TextContentBlock);
-    }
-
-    if (message['reasoning_content']) {
-      contentBlocks.push({
-        type: MessageContentType.Thinking,
-        thinking: message['reasoning_content'],
-        signature: message['reasoning_content'],
-      } as ThinkingContentBlock);
     }
 
     // Handle tool calls

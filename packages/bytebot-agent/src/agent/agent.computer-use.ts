@@ -23,22 +23,109 @@ import {
 } from '@bytebot/shared';
 import { Logger } from '@nestjs/common';
 
-const BYTEBOT_DESKTOP_BASE_URL = process.env.BYTEBOT_DESKTOP_BASE_URL as string;
+/**
+ * Fallback desktop URL for legacy mode (Phase 6 not deployed)
+ */
+const FALLBACK_DESKTOP_URL = process.env.BYTEBOT_DESKTOP_BASE_URL as string;
 
+/**
+ * Phase 4: Error class for execution surface constraint violations
+ */
+export class DesktopRequiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DesktopRequiredError';
+  }
+}
+
+/**
+ * Get the desktop URL to use for API calls
+ * Phase 4: Now validates desktop requirement before falling back
+ * @param desktopUrl - Per-task desktop URL from task controller (Phase 6)
+ * @param requiresDesktop - Whether this task requires a desktop pod (Phase 4)
+ * @returns The URL to use for desktop API calls
+ * @throws DesktopRequiredError if desktop is required but not available
+ */
+function getDesktopUrl(desktopUrl?: string, requiresDesktop?: boolean): string {
+  // If desktop is explicitly required, we must have a per-task URL
+  if (requiresDesktop && !desktopUrl) {
+    throw new DesktopRequiredError(
+      'Task requires desktop but no desktop pod is assigned. ' +
+      'Ensure task has a desktop pod before executing desktop tools.',
+    );
+  }
+
+  // Log warning when falling back (but allow for non-required tasks)
+  if (!desktopUrl && FALLBACK_DESKTOP_URL) {
+    console.warn(
+      '[Phase 4 Warning] Using fallback desktop URL. ' +
+      'For production, ensure desktop pods are properly assigned.',
+    );
+  }
+
+  return desktopUrl || FALLBACK_DESKTOP_URL;
+}
+
+/**
+ * Context for action execution (Phase 6.4)
+ */
+export interface ActionContext {
+  taskId: string;
+  desktopUrl?: string;
+  // Phase 4: Execution surface constraint
+  requiresDesktop?: boolean;
+  onAction?: (action: ActionResult) => void;
+}
+
+/**
+ * Result of an action execution (for logging)
+ */
+export interface ActionResult {
+  actionType: string;
+  success: boolean;
+  durationMs: number;
+  coordinates?: { x: number; y: number };
+  errorMessage?: string;
+  input?: Record<string, unknown>;
+}
+
+/**
+ * Handle computer tool use with optional per-task context
+ * @param block - The computer tool use content block from LLM
+ * @param logger - Logger instance
+ * @param context - Optional action context with per-task desktop URL (Phase 6.4)
+ */
 export async function handleComputerToolUse(
   block: ComputerToolUseContentBlock,
   logger: Logger,
+  context?: ActionContext,
 ): Promise<ToolResultContentBlock> {
+  // Phase 4: Pass requiresDesktop to enable fail-fast validation
+  const desktopUrl = getDesktopUrl(context?.desktopUrl, context?.requiresDesktop);
   logger.debug(
     `Handling computer tool use: ${block.name}, tool_use_id: ${block.id}`,
   );
 
+  // Helper to report action results
+  const reportAction = (result: ActionResult) => {
+    if (context?.onAction) {
+      context.onAction(result);
+    }
+  };
+
   if (isScreenshotToolUseBlock(block)) {
     logger.debug('Processing screenshot request');
+    const startTime = Date.now();
     try {
       logger.debug('Taking screenshot');
-      const image = await screenshot();
+      const image = await screenshot(desktopUrl);
       logger.debug('Screenshot captured successfully');
+
+      reportAction({
+        actionType: 'screenshot',
+        success: true,
+        durationMs: Date.now() - startTime,
+      });
 
       return {
         type: MessageContentType.ToolResult,
@@ -56,6 +143,12 @@ export async function handleComputerToolUse(
       };
     } catch (error) {
       logger.error(`Screenshot failed: ${error.message}`, error.stack);
+      reportAction({
+        actionType: 'screenshot',
+        success: false,
+        durationMs: Date.now() - startTime,
+        errorMessage: error.message,
+      });
       return {
         type: MessageContentType.ToolResult,
         tool_use_id: block.id,
@@ -72,10 +165,18 @@ export async function handleComputerToolUse(
 
   if (isCursorPositionToolUseBlock(block)) {
     logger.debug('Processing cursor position request');
+    const startTime = Date.now();
     try {
       logger.debug('Getting cursor position');
-      const position = await cursorPosition();
+      const position = await cursorPosition(desktopUrl);
       logger.debug(`Cursor position obtained: ${position.x}, ${position.y}`);
+
+      reportAction({
+        actionType: 'cursor_position',
+        success: true,
+        durationMs: Date.now() - startTime,
+        coordinates: position,
+      });
 
       return {
         type: MessageContentType.ToolResult,
@@ -92,6 +193,12 @@ export async function handleComputerToolUse(
         `Getting cursor position failed: ${error.message}`,
         error.stack,
       );
+      reportAction({
+        actionType: 'cursor_position',
+        success: false,
+        durationMs: Date.now() - startTime,
+        errorMessage: error.message,
+      });
       return {
         type: MessageContentType.ToolResult,
         tool_use_id: block.id,
@@ -106,46 +213,74 @@ export async function handleComputerToolUse(
     }
   }
 
+  const startTime = Date.now();
+  let actionType = block.name;
+  let actionCoordinates: { x: number; y: number } | undefined;
+
   try {
     if (isMoveMouseToolUseBlock(block)) {
-      await moveMouse(block.input);
+      actionType = 'computer_move_mouse';
+      actionCoordinates = block.input.coordinates;
+      await moveMouse(block.input, desktopUrl);
     }
     if (isTraceMouseToolUseBlock(block)) {
-      await traceMouse(block.input);
+      actionType = 'computer_trace_mouse';
+      await traceMouse(block.input, desktopUrl);
     }
     if (isClickMouseToolUseBlock(block)) {
-      await clickMouse(block.input);
+      actionType = 'computer_click_mouse';
+      actionCoordinates = block.input.coordinates;
+      await clickMouse(block.input, desktopUrl);
     }
     if (isPressMouseToolUseBlock(block)) {
-      await pressMouse(block.input);
+      actionType = 'computer_press_mouse';
+      actionCoordinates = block.input.coordinates;
+      await pressMouse(block.input, desktopUrl);
     }
     if (isDragMouseToolUseBlock(block)) {
-      await dragMouse(block.input);
+      actionType = 'computer_drag_mouse';
+      await dragMouse(block.input, desktopUrl);
     }
     if (isScrollToolUseBlock(block)) {
-      await scroll(block.input);
+      actionType = 'computer_scroll';
+      actionCoordinates = block.input.coordinates;
+      await scroll(block.input, desktopUrl);
     }
     if (isTypeKeysToolUseBlock(block)) {
-      await typeKeys(block.input);
+      actionType = 'computer_type_keys';
+      await typeKeys(block.input, desktopUrl);
     }
     if (isPressKeysToolUseBlock(block)) {
-      await pressKeys(block.input);
+      actionType = 'computer_press_keys';
+      await pressKeys(block.input, desktopUrl);
     }
     if (isTypeTextToolUseBlock(block)) {
-      await typeText(block.input);
+      actionType = 'computer_type_text';
+      await typeText(block.input, desktopUrl);
     }
     if (isPasteTextToolUseBlock(block)) {
-      await pasteText(block.input);
+      actionType = 'computer_paste_text';
+      await pasteText(block.input, desktopUrl);
     }
     if (isWaitToolUseBlock(block)) {
-      await wait(block.input);
+      actionType = 'computer_wait';
+      await wait(block.input, desktopUrl);
     }
     if (isApplicationToolUseBlock(block)) {
-      await application(block.input);
+      actionType = 'computer_application';
+      await application(block.input, desktopUrl);
     }
     if (isReadFileToolUseBlock(block)) {
+      actionType = 'computer_read_file';
       logger.debug(`Reading file: ${block.input.path}`);
-      const result = await readFile(block.input);
+      const result = await readFile(block.input, desktopUrl);
+
+      reportAction({
+        actionType,
+        success: result.success,
+        durationMs: Date.now() - startTime,
+        input: { path: block.input.path },
+      });
 
       if (result.success && result.data) {
         // Return document content block
@@ -181,6 +316,14 @@ export async function handleComputerToolUse(
       }
     }
 
+    // Report successful action
+    reportAction({
+      actionType,
+      success: true,
+      durationMs: Date.now() - startTime,
+      coordinates: actionCoordinates,
+    });
+
     let image: string | null = null;
     try {
       // Wait before taking screenshot to allow UI to settle
@@ -189,7 +332,7 @@ export async function handleComputerToolUse(
       await new Promise((resolve) => setTimeout(resolve, delayMs));
 
       logger.debug('Taking screenshot');
-      image = await screenshot();
+      image = await screenshot(desktopUrl);
       logger.debug('Screenshot captured successfully');
     } catch (error) {
       logger.error('Failed to take screenshot', error);
@@ -224,6 +367,16 @@ export async function handleComputerToolUse(
       `Error executing ${block.name} tool: ${error.message}`,
       error.stack,
     );
+
+    // Report failed action
+    reportAction({
+      actionType,
+      success: false,
+      durationMs: Date.now() - startTime,
+      coordinates: actionCoordinates,
+      errorMessage: error.message,
+    });
+
     return {
       type: MessageContentType.ToolResult,
       tool_use_id: block.id,
@@ -238,14 +391,21 @@ export async function handleComputerToolUse(
   }
 }
 
-async function moveMouse(input: { coordinates: Coordinates }): Promise<void> {
+/**
+ * Action functions - all accept optional desktopUrl for Phase 6.4 per-task routing
+ */
+
+async function moveMouse(
+  input: { coordinates: Coordinates },
+  desktopUrl: string,
+): Promise<void> {
   const { coordinates } = input;
   console.log(
     `Moving mouse to coordinates: [${coordinates.x}, ${coordinates.y}]`,
   );
 
   try {
-    await fetch(`${BYTEBOT_DESKTOP_BASE_URL}/computer-use`, {
+    await fetch(`${desktopUrl}/computer-use`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -259,17 +419,20 @@ async function moveMouse(input: { coordinates: Coordinates }): Promise<void> {
   }
 }
 
-async function traceMouse(input: {
-  path: Coordinates[];
-  holdKeys?: string[];
-}): Promise<void> {
+async function traceMouse(
+  input: {
+    path: Coordinates[];
+    holdKeys?: string[];
+  },
+  desktopUrl: string,
+): Promise<void> {
   const { path, holdKeys } = input;
   console.log(
     `Tracing mouse to path: ${path} ${holdKeys ? `with holdKeys: ${holdKeys}` : ''}`,
   );
 
   try {
-    await fetch(`${BYTEBOT_DESKTOP_BASE_URL}/computer-use`, {
+    await fetch(`${desktopUrl}/computer-use`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -284,19 +447,22 @@ async function traceMouse(input: {
   }
 }
 
-async function clickMouse(input: {
-  coordinates?: Coordinates;
-  button: Button;
-  holdKeys?: string[];
-  clickCount: number;
-}): Promise<void> {
+async function clickMouse(
+  input: {
+    coordinates?: Coordinates;
+    button: Button;
+    holdKeys?: string[];
+    clickCount: number;
+  },
+  desktopUrl: string,
+): Promise<void> {
   const { coordinates, button, holdKeys, clickCount } = input;
   console.log(
     `Clicking mouse ${button} ${clickCount} times ${coordinates ? `at coordinates: [${coordinates.x}, ${coordinates.y}] ` : ''} ${holdKeys ? `with holdKeys: ${holdKeys}` : ''}`,
   );
 
   try {
-    await fetch(`${BYTEBOT_DESKTOP_BASE_URL}/computer-use`, {
+    await fetch(`${desktopUrl}/computer-use`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -313,18 +479,21 @@ async function clickMouse(input: {
   }
 }
 
-async function pressMouse(input: {
-  coordinates?: Coordinates;
-  button: Button;
-  press: Press;
-}): Promise<void> {
+async function pressMouse(
+  input: {
+    coordinates?: Coordinates;
+    button: Button;
+    press: Press;
+  },
+  desktopUrl: string,
+): Promise<void> {
   const { coordinates, button, press } = input;
   console.log(
     `Pressing mouse ${button} ${press} ${coordinates ? `at coordinates: [${coordinates.x}, ${coordinates.y}]` : ''}`,
   );
 
   try {
-    await fetch(`${BYTEBOT_DESKTOP_BASE_URL}/computer-use`, {
+    await fetch(`${desktopUrl}/computer-use`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -340,18 +509,21 @@ async function pressMouse(input: {
   }
 }
 
-async function dragMouse(input: {
-  path: Coordinates[];
-  button: Button;
-  holdKeys?: string[];
-}): Promise<void> {
+async function dragMouse(
+  input: {
+    path: Coordinates[];
+    button: Button;
+    holdKeys?: string[];
+  },
+  desktopUrl: string,
+): Promise<void> {
   const { path, button, holdKeys } = input;
   console.log(
     `Dragging mouse to path: ${path} ${holdKeys ? `with holdKeys: ${holdKeys}` : ''}`,
   );
 
   try {
-    await fetch(`${BYTEBOT_DESKTOP_BASE_URL}/computer-use`, {
+    await fetch(`${desktopUrl}/computer-use`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -367,19 +539,22 @@ async function dragMouse(input: {
   }
 }
 
-async function scroll(input: {
-  coordinates?: Coordinates;
-  direction: 'up' | 'down' | 'left' | 'right';
-  scrollCount: number;
-  holdKeys?: string[];
-}): Promise<void> {
+async function scroll(
+  input: {
+    coordinates?: Coordinates;
+    direction: 'up' | 'down' | 'left' | 'right';
+    scrollCount: number;
+    holdKeys?: string[];
+  },
+  desktopUrl: string,
+): Promise<void> {
   const { coordinates, direction, scrollCount, holdKeys } = input;
   console.log(
     `Scrolling ${direction} ${scrollCount} times ${coordinates ? `at coordinates: [${coordinates.x}, ${coordinates.y}]` : ''}`,
   );
 
   try {
-    await fetch(`${BYTEBOT_DESKTOP_BASE_URL}/computer-use`, {
+    await fetch(`${desktopUrl}/computer-use`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -396,15 +571,18 @@ async function scroll(input: {
   }
 }
 
-async function typeKeys(input: {
-  keys: string[];
-  delay?: number;
-}): Promise<void> {
+async function typeKeys(
+  input: {
+    keys: string[];
+    delay?: number;
+  },
+  desktopUrl: string,
+): Promise<void> {
   const { keys, delay } = input;
   console.log(`Typing keys: ${keys}`);
 
   try {
-    await fetch(`${BYTEBOT_DESKTOP_BASE_URL}/computer-use`, {
+    await fetch(`${desktopUrl}/computer-use`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -419,15 +597,18 @@ async function typeKeys(input: {
   }
 }
 
-async function pressKeys(input: {
-  keys: string[];
-  press: Press;
-}): Promise<void> {
+async function pressKeys(
+  input: {
+    keys: string[];
+    press: Press;
+  },
+  desktopUrl: string,
+): Promise<void> {
   const { keys, press } = input;
   console.log(`Pressing keys: ${keys}`);
 
   try {
-    await fetch(`${BYTEBOT_DESKTOP_BASE_URL}/computer-use`, {
+    await fetch(`${desktopUrl}/computer-use`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -442,15 +623,18 @@ async function pressKeys(input: {
   }
 }
 
-async function typeText(input: {
-  text: string;
-  delay?: number;
-}): Promise<void> {
+async function typeText(
+  input: {
+    text: string;
+    delay?: number;
+  },
+  desktopUrl: string,
+): Promise<void> {
   const { text, delay } = input;
   console.log(`Typing text: ${text}`);
 
   try {
-    await fetch(`${BYTEBOT_DESKTOP_BASE_URL}/computer-use`, {
+    await fetch(`${desktopUrl}/computer-use`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -465,12 +649,15 @@ async function typeText(input: {
   }
 }
 
-async function pasteText(input: { text: string }): Promise<void> {
+async function pasteText(
+  input: { text: string },
+  desktopUrl: string,
+): Promise<void> {
   const { text } = input;
   console.log(`Pasting text: ${text}`);
 
   try {
-    await fetch(`${BYTEBOT_DESKTOP_BASE_URL}/computer-use`, {
+    await fetch(`${desktopUrl}/computer-use`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -484,12 +671,15 @@ async function pasteText(input: { text: string }): Promise<void> {
   }
 }
 
-async function wait(input: { duration: number }): Promise<void> {
+async function wait(
+  input: { duration: number },
+  desktopUrl: string,
+): Promise<void> {
   const { duration } = input;
   console.log(`Waiting for ${duration}ms`);
 
   try {
-    await fetch(`${BYTEBOT_DESKTOP_BASE_URL}/computer-use`, {
+    await fetch(`${desktopUrl}/computer-use`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -503,11 +693,11 @@ async function wait(input: { duration: number }): Promise<void> {
   }
 }
 
-async function cursorPosition(): Promise<Coordinates> {
+async function cursorPosition(desktopUrl: string): Promise<Coordinates> {
   console.log('Getting cursor position');
 
   try {
-    const response = await fetch(`${BYTEBOT_DESKTOP_BASE_URL}/computer-use`, {
+    const response = await fetch(`${desktopUrl}/computer-use`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -523,7 +713,7 @@ async function cursorPosition(): Promise<Coordinates> {
   }
 }
 
-async function screenshot(): Promise<string> {
+async function screenshot(desktopUrl: string): Promise<string> {
   console.log('Taking screenshot');
 
   try {
@@ -531,7 +721,7 @@ async function screenshot(): Promise<string> {
       action: 'screenshot',
     };
 
-    const response = await fetch(`${BYTEBOT_DESKTOP_BASE_URL}/computer-use`, {
+    const response = await fetch(`${desktopUrl}/computer-use`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(requestBody),
@@ -554,17 +744,20 @@ async function screenshot(): Promise<string> {
   }
 }
 
-async function application(input: { application: string }): Promise<void> {
-  const { application } = input;
-  console.log(`Opening application: ${application}`);
+async function application(
+  input: { application: string },
+  desktopUrl: string,
+): Promise<void> {
+  const { application: app } = input;
+  console.log(`Opening application: ${app}`);
 
   try {
-    await fetch(`${BYTEBOT_DESKTOP_BASE_URL}/computer-use`, {
+    await fetch(`${desktopUrl}/computer-use`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         action: 'application',
-        application,
+        application: app,
       }),
     });
   } catch (error) {
@@ -573,7 +766,10 @@ async function application(input: { application: string }): Promise<void> {
   }
 }
 
-async function readFile(input: { path: string }): Promise<{
+async function readFile(
+  input: { path: string },
+  desktopUrl: string,
+): Promise<{
   success: boolean;
   data?: string;
   name?: string;
@@ -585,7 +781,7 @@ async function readFile(input: { path: string }): Promise<{
   console.log(`Reading file: ${path}`);
 
   try {
-    const response = await fetch(`${BYTEBOT_DESKTOP_BASE_URL}/computer-use`, {
+    const response = await fetch(`${desktopUrl}/computer-use`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -609,18 +805,25 @@ async function readFile(input: { path: string }): Promise<{
   }
 }
 
-export async function writeFile(input: {
-  path: string;
-  content: string;
-}): Promise<{ success: boolean; message?: string }> {
+/**
+ * Write file to desktop - also updated for Phase 6.4
+ */
+export async function writeFile(
+  input: {
+    path: string;
+    content: string;
+  },
+  desktopUrl?: string,
+): Promise<{ success: boolean; message?: string }> {
   const { path, content } = input;
+  const url = getDesktopUrl(desktopUrl);
   console.log(`Writing file: ${path}`);
 
   try {
     // Content is always base64 encoded
     const base64Data = content;
 
-    const response = await fetch(`${BYTEBOT_DESKTOP_BASE_URL}/computer-use`, {
+    const response = await fetch(`${url}/computer-use`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

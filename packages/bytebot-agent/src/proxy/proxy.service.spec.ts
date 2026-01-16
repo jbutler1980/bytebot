@@ -35,6 +35,7 @@ describe('ProxyService endpoint failover', () => {
           BYTEBOT_LLM_PROXY_DESKTOP_VISION_ENDPOINTS:
             'http://local-proxy:4000,http://global-proxy:4000',
           BYTEBOT_LLM_PROXY_API_KEY: 'dummy',
+          BYTEBOT_LLM_PROXY_ENDPOINT_PREFLIGHT_ENABLED: 'false',
         };
         return map[key] ?? '';
       }),
@@ -80,7 +81,9 @@ describe('ProxyService endpoint failover', () => {
       },
     ] as any;
 
-    const response = await service.generateMessage('system', messages, 'desktop-vision', false);
+    const response = await service.generateMessage('system', messages, 'desktop-vision', {
+      useTools: false,
+    });
     expect(response.contentBlocks[0]).toEqual({ type: MessageContentType.Text, text: 'ok' });
 
     expect(localCreate).toHaveBeenCalledTimes(1);
@@ -90,6 +93,89 @@ describe('ProxyService endpoint failover', () => {
       'llm.endpoint.failover',
       expect.objectContaining({
         reason: 'NETWORK',
+        requestedModel: 'desktop-vision',
+      }),
+    );
+  });
+
+  it('fails over to the next endpoint on invalid/empty LLM responses', async () => {
+    const eventEmitter = { emit: jest.fn() };
+    const llmResilienceService = makeResilience(eventEmitter);
+
+    const configService = {
+      get: jest.fn((key: string) => {
+        const map: Record<string, string> = {
+          BYTEBOT_LLM_PROXY_URL: 'http://local-proxy:4000',
+          BYTEBOT_LLM_PROXY_ENDPOINTS:
+            'http://local-proxy:4000,http://global-proxy:4000',
+          BYTEBOT_LLM_PROXY_DESKTOP_VISION_ENDPOINTS:
+            'http://local-proxy:4000,http://global-proxy:4000',
+          BYTEBOT_LLM_PROXY_API_KEY: 'dummy',
+          BYTEBOT_LLM_PROXY_ENDPOINT_PREFLIGHT_ENABLED: 'false',
+        };
+        return map[key] ?? '';
+      }),
+    } as any;
+
+    const localCreate = jest.fn(async () => {
+      return {
+        model: 'desktop-vision',
+        // Invalid/empty message (no content/tool_calls)
+        choices: [{ message: { content: null } }],
+        usage: { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1 },
+      };
+    });
+
+    const globalCreate = jest.fn(async () => {
+      return {
+        model: 'desktop-vision',
+        choices: [{ message: { content: 'ok' } }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      };
+    });
+
+    class TestProxyService extends ProxyService {
+      protected override createOpenAIClient(baseURL: string): any {
+        if (baseURL.includes('local-proxy')) {
+          return { chat: { completions: { create: localCreate } } };
+        }
+        return { chat: { completions: { create: globalCreate } } };
+      }
+    }
+
+    const service = new TestProxyService(
+      configService,
+      llmResilienceService,
+      eventEmitter as any,
+    );
+
+    const messages = [
+      {
+        id: 'm1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        taskId: 't1',
+        summaryId: null,
+        role: Role.USER,
+        content: [{ type: MessageContentType.Text, text: 'hello' }],
+      },
+    ] as any;
+
+    const response = await service.generateMessage('system', messages, 'desktop-vision', {
+      useTools: false,
+    });
+    expect(response.contentBlocks[0]).toEqual({
+      type: MessageContentType.Text,
+      text: 'ok',
+    });
+
+    expect(localCreate).toHaveBeenCalledTimes(1);
+    expect(globalCreate).toHaveBeenCalledTimes(1);
+
+    expect(eventEmitter.emit).toHaveBeenCalledWith(
+      'llm.endpoint.failover',
+      expect.objectContaining({
+        reason: 'SERVER_ERROR',
         requestedModel: 'desktop-vision',
       }),
     );
@@ -109,6 +195,7 @@ describe('ProxyService endpoint failover', () => {
           BYTEBOT_LLM_PROXY_DESKTOP_VISION_ENDPOINTS:
             'http://global-proxy:4000,http://local-proxy:4000',
           BYTEBOT_LLM_PROXY_API_KEY: 'dummy',
+          BYTEBOT_LLM_PROXY_ENDPOINT_PREFLIGHT_ENABLED: 'false',
         };
         return map[key] ?? '';
       }),
@@ -158,11 +245,139 @@ describe('ProxyService endpoint failover', () => {
       'system',
       messages,
       'openai/qwen3-vl-32b',
-      false,
+      { useTools: false },
     );
 
     expect(globalCreate).toHaveBeenCalledTimes(1);
     expect(localCreate).toHaveBeenCalledTimes(0);
+  });
+
+  it('does not replay Thinking blocks into Chat Completions history', async () => {
+    const eventEmitter = { emit: jest.fn() };
+    const llmResilienceService = makeResilience(eventEmitter);
+
+    const configService = {
+      get: jest.fn((key: string) => {
+        const map: Record<string, string> = {
+          BYTEBOT_LLM_PROXY_URL: 'http://global-proxy:4000',
+          BYTEBOT_LLM_PROXY_ENDPOINTS: 'http://global-proxy:4000',
+          BYTEBOT_LLM_PROXY_DESKTOP_VISION_ENDPOINTS: 'http://global-proxy:4000',
+          BYTEBOT_LLM_PROXY_API_KEY: 'dummy',
+          BYTEBOT_LLM_PROXY_ENDPOINT_PREFLIGHT_ENABLED: 'false',
+        };
+        return map[key] ?? '';
+      }),
+    } as any;
+
+    let capturedRequest: any | undefined;
+    const globalCreate = jest.fn(async (req: any) => {
+      capturedRequest = req;
+      return {
+        model: 'desktop-vision',
+        choices: [{ message: { content: 'ok' } }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      };
+    });
+
+    class TestProxyService extends ProxyService {
+      protected override createOpenAIClient(): any {
+        return { chat: { completions: { create: globalCreate } } };
+      }
+    }
+
+    const service = new TestProxyService(
+      configService,
+      llmResilienceService,
+      eventEmitter as any,
+    );
+
+    const messages = [
+      {
+        id: 'm1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        taskId: 't1',
+        summaryId: null,
+        role: Role.ASSISTANT,
+        content: [
+          {
+            type: MessageContentType.Thinking,
+            thinking: 'secret thinking',
+            signature: 'sig',
+          },
+        ],
+      },
+    ] as any;
+
+    await service.generateMessage('system', messages, 'desktop-vision', { useTools: false });
+
+    expect(globalCreate).toHaveBeenCalledTimes(1);
+    expect(capturedRequest?.messages).toEqual([
+      { role: 'system', content: 'system' },
+    ]);
+  });
+
+  it('does not expose desktop tools when executionSurface=TEXT_ONLY', async () => {
+    const eventEmitter = { emit: jest.fn() };
+    const llmResilienceService = makeResilience(eventEmitter);
+
+    const configService = {
+      get: jest.fn((key: string) => {
+        const map: Record<string, string> = {
+          BYTEBOT_LLM_PROXY_URL: 'http://global-proxy:4000',
+          BYTEBOT_LLM_PROXY_ENDPOINTS: 'http://global-proxy:4000',
+          BYTEBOT_LLM_PROXY_DESKTOP_VISION_ENDPOINTS: 'http://global-proxy:4000',
+          BYTEBOT_LLM_PROXY_API_KEY: 'dummy',
+          BYTEBOT_LLM_PROXY_ENDPOINT_PREFLIGHT_ENABLED: 'false',
+        };
+        return map[key] ?? '';
+      }),
+    } as any;
+
+    let capturedRequest: any | undefined;
+    const globalCreate = jest.fn(async (req: any) => {
+      capturedRequest = req;
+      return {
+        model: 'desktop-vision',
+        choices: [{ message: { content: 'ok' } }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      };
+    });
+
+    class TestProxyService extends ProxyService {
+      protected override createOpenAIClient(): any {
+        return { chat: { completions: { create: globalCreate } } };
+      }
+    }
+
+    const service = new TestProxyService(
+      configService,
+      llmResilienceService,
+      eventEmitter as any,
+    );
+
+    const messages = [
+      {
+        id: 'm1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        taskId: 't1',
+        summaryId: null,
+        role: Role.USER,
+        content: [{ type: MessageContentType.Text, text: 'hello' }],
+      },
+    ] as any;
+
+    await service.generateMessage('system', messages, 'desktop-vision', {
+      useTools: true,
+      toolPolicy: { requiresDesktop: false, executionSurface: 'TEXT_ONLY' },
+    });
+
+    expect(globalCreate).toHaveBeenCalledTimes(1);
+
+    const toolNames = (capturedRequest?.tools || []).map((t: any) => t.function?.name);
+    expect(toolNames).toContain('set_task_status');
+    expect(toolNames.some((name: string) => name?.startsWith('computer_'))).toBe(false);
   });
 
   it('limits historical screenshots sent to the model (desktop-vision)', async () => {
@@ -178,6 +393,7 @@ describe('ProxyService endpoint failover', () => {
           BYTEBOT_LLM_PROXY_API_KEY: 'dummy',
           BYTEBOT_LLM_MAX_IMAGE_BLOCKS: '10',
           BYTEBOT_LLM_MAX_IMAGE_BLOCKS_DESKTOP_VISION: '1',
+          BYTEBOT_LLM_PROXY_ENDPOINT_PREFLIGHT_ENABLED: 'false',
         };
         return map[key] ?? '';
       }),
@@ -248,10 +464,185 @@ describe('ProxyService endpoint failover', () => {
       },
     ] as any;
 
-    await service.generateMessage('system', messages, 'desktop-vision', false);
+    await service.generateMessage('system', messages, 'desktop-vision', { useTools: false });
 
     const msgJson = JSON.stringify(capturedRequest?.messages || []);
     expect(msgJson).toContain('BBB');
     expect(msgJson).not.toContain('AAA');
+  });
+
+  it('fails over without calling the endpoint when preflight fails', async () => {
+    const eventEmitter = { emit: jest.fn() };
+    const llmResilienceService = makeResilience(eventEmitter);
+
+    const configService = {
+      get: jest.fn((key: string) => {
+        const map: Record<string, string> = {
+          BYTEBOT_LLM_PROXY_URL: 'http://local-proxy:4000',
+          BYTEBOT_LLM_PROXY_ENDPOINTS:
+            'http://local-proxy:4000,http://global-proxy:4000',
+          BYTEBOT_LLM_PROXY_DESKTOP_VISION_ENDPOINTS:
+            'http://local-proxy:4000,http://global-proxy:4000',
+          BYTEBOT_LLM_PROXY_API_KEY: 'dummy',
+          BYTEBOT_LLM_PROXY_ENDPOINT_PREFLIGHT_ENABLED: 'true',
+          BYTEBOT_LLM_PROXY_ENDPOINT_PREFLIGHT_TTL_MS: '0',
+          BYTEBOT_LLM_PROXY_ENDPOINT_PREFLIGHT_TIMEOUT_MS: '1',
+        };
+        return map[key] ?? '';
+      }),
+    } as any;
+
+    const localCreate = jest.fn(async () => {
+      return {
+        model: 'desktop-vision',
+        choices: [{ message: { content: 'bad' } }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      };
+    });
+    const globalCreate = jest.fn(async () => {
+      return {
+        model: 'desktop-vision',
+        choices: [{ message: { content: 'ok' } }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      };
+    });
+
+    class TestProxyService extends ProxyService {
+      protected override async preflightEndpoint(baseUrl: string): Promise<boolean> {
+        return !baseUrl.includes('local-proxy');
+      }
+      protected override createOpenAIClient(baseURL: string): any {
+        if (baseURL.includes('local-proxy')) {
+          return { chat: { completions: { create: localCreate } } };
+        }
+        return { chat: { completions: { create: globalCreate } } };
+      }
+    }
+
+    const service = new TestProxyService(
+      configService,
+      llmResilienceService,
+      eventEmitter as any,
+    );
+
+    const messages = [
+      {
+        id: 'm1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        taskId: 't1',
+        summaryId: null,
+        role: Role.USER,
+        content: [{ type: MessageContentType.Text, text: 'hello' }],
+      },
+    ] as any;
+
+    const response = await service.generateMessage('system', messages, 'desktop-vision', {
+      useTools: false,
+    });
+    expect(response.contentBlocks[0]).toEqual({ type: MessageContentType.Text, text: 'ok' });
+
+    expect(localCreate).toHaveBeenCalledTimes(0);
+    expect(globalCreate).toHaveBeenCalledTimes(1);
+
+    expect(eventEmitter.emit).toHaveBeenCalledWith(
+      'llm.endpoint.failover',
+      expect.objectContaining({
+        reason: 'NETWORK',
+        requestedModel: 'desktop-vision',
+      }),
+    );
+  });
+
+  it('drops invalid assistant/tool messages before sending to LiteLLM', async () => {
+    const eventEmitter = { emit: jest.fn() };
+    const llmResilienceService = makeResilience(eventEmitter);
+
+    const configService = {
+      get: jest.fn((key: string) => {
+        const map: Record<string, string> = {
+          BYTEBOT_LLM_PROXY_URL: 'http://global-proxy:4000',
+          BYTEBOT_LLM_PROXY_ENDPOINTS: 'http://global-proxy:4000',
+          BYTEBOT_LLM_PROXY_DESKTOP_VISION_ENDPOINTS: 'http://global-proxy:4000',
+          BYTEBOT_LLM_PROXY_API_KEY: 'dummy',
+          BYTEBOT_LLM_PROXY_ENDPOINT_PREFLIGHT_ENABLED: 'false',
+        };
+        return map[key] ?? '';
+      }),
+    } as any;
+
+    let capturedRequest: any | undefined;
+    const globalCreate = jest.fn(async (req: any) => {
+      capturedRequest = req;
+      return {
+        model: 'gpt-oss-120b',
+        choices: [{ message: { content: 'ok' } }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      };
+    });
+
+    class TestProxyService extends ProxyService {
+      protected override createOpenAIClient(): any {
+        return { chat: { completions: { create: globalCreate } } };
+      }
+    }
+
+    const service = new TestProxyService(
+      configService,
+      llmResilienceService,
+      eventEmitter as any,
+    );
+
+    const messages = [
+      // Invalid assistant message: empty/whitespace-only content
+      {
+        id: 'm1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        taskId: 't1',
+        summaryId: null,
+        role: Role.ASSISTANT,
+        content: [{ type: MessageContentType.Text, text: '   ' }],
+      },
+      // Orphan tool result: no matching assistant tool call
+      {
+        id: 'm2',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        taskId: 't1',
+        summaryId: null,
+        role: Role.USER,
+        content: [
+          {
+            type: MessageContentType.ToolResult,
+            tool_use_id: 'tool-1',
+            content: [{ type: MessageContentType.Text, text: 'result' }],
+          },
+        ],
+      },
+      {
+        id: 'm3',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        taskId: 't1',
+        summaryId: null,
+        role: Role.USER,
+        content: [{ type: MessageContentType.Text, text: 'hello' }],
+      },
+    ] as any;
+
+    await service.generateMessage('system', messages, 'gpt-oss-120b', { useTools: false });
+    expect(globalCreate).toHaveBeenCalledTimes(1);
+
+    const roles = (capturedRequest?.messages || []).map((m: any) => m.role);
+    expect(roles).toContain('system');
+    expect(roles).toContain('user');
+    expect(roles).not.toContain('tool');
+
+    expect(capturedRequest?.messages).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ role: 'assistant', content: '   ' }),
+      ]),
+    );
   });
 });
