@@ -47,6 +47,7 @@ import { detectPlannerFirstStepUserInputReason, PlannerFirstStepUserInputError }
 import {
   ExecuteStepHasInteractionToolError,
   PlannerOutputContractViolationError,
+  hasDesktopExecutionTool,
   hasUserInteractionTool,
   normalizeSuggestedToolsOrThrow,
 } from '../contracts/planner-tools';
@@ -791,7 +792,10 @@ export class PlannerService {
         };
       }
 
-      return { ...item, suggestedTools };
+      const requiresDesktop =
+        Boolean(item.requiresDesktop) || hasDesktopExecutionTool(suggestedTools);
+
+      return { ...item, suggestedTools, requiresDesktop };
     });
 
     const first = normalizedItems[0];

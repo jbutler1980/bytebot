@@ -136,6 +136,34 @@ export function hasUserInteractionTool(suggestedTools?: string[] | null): boolea
   return false;
 }
 
+const DESKTOP_EXECUTION_TOOL_KEYS = new Set(
+  [
+    // Planner hints (bytebot templates)
+    'browser',
+    'file_download',
+
+    // Desktop / computer-use tools (agent-side)
+    'computer',
+    'click',
+    'type',
+    'key',
+    'scroll',
+    'screenshot',
+    'move',
+    'drag',
+    'cursor_position',
+  ].map(normalizeToolTokenKey),
+);
+
+export function hasDesktopExecutionTool(suggestedTools?: string[] | null): boolean {
+  const tools = Array.isArray(suggestedTools) ? suggestedTools : [];
+  for (const raw of tools) {
+    if (typeof raw !== 'string') continue;
+    if (DESKTOP_EXECUTION_TOOL_KEYS.has(normalizeToolTokenKey(raw))) return true;
+  }
+  return false;
+}
+
 export function normalizeSuggestedToolsOrThrow(params: {
   suggestedTools?: string[] | null;
   allowedTools?: string[] | null;
@@ -189,4 +217,3 @@ export function normalizeSuggestedToolsOrThrow(params: {
 
   return normalized;
 }
-

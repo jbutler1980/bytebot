@@ -1271,6 +1271,7 @@ enum GoalRunPhase {
   CONTROLLING_DESKTOP
   WAITING_USER_INPUT
   WAITING_APPROVAL
+  WAITING_PROVIDER
   VERIFYING
   REPLANNING
   COMPLETED
@@ -1746,6 +1747,7 @@ model UserPrompt {
   approvalRequest ApprovalRequest? @relation(fields: [approvalRequestId], references: [id], onDelete: Cascade)
   desktopLease  DesktopLease?  @relation(fields: [desktopLeaseId], references: [id], onDelete: Cascade)
   resolutions   UserPromptResolution[]
+  attempts      UserPromptAttempt[]
 
   @@index([tenantId])
   @@index([goalRunId])
@@ -1808,6 +1810,60 @@ model UserPromptResolution {
   @@index([resumeAcknowledgedAt])
   @@index([createdAt])
   @@map("user_prompt_resolutions")
+  @@schema("workflow_orchestrator")
+}
+
+// ============================================================================
+// User Prompt Attempt Entity
+// Append-only submission log (records invalid attempts without mutating prompt history)
+// ============================================================================
+
+model UserPromptAttempt {
+  id       String @id @default(cuid())
+  promptId String @map("prompt_id")
+
+  tenantId  String @map("tenant_id")
+  goalRunId String @map("goal_run_id")
+
+  actorType      ActorType @map("actor_type")
+  actorId        String?   @map("actor_id")
+  actorEmail     String?   @map("actor_email")
+  actorName      String?   @map("actor_name")
+  actorIpAddress String?   @map("actor_ip_address")
+  actorUserAgent String?   @map("actor_user_agent")
+
+  requestId        String? @map("request_id")
+  authContext      Json?   @map("auth_context")
+  clientRequestId  String? @map("client_request_id")
+  idempotencyKey   String? @map("idempotency_key")
+
+  // Authorization snapshot (ALLOW/DENY) for the attempt.
+  authzDecision String @default("ALLOW") @map("authz_decision")
+  authzPolicy   String? @map("authz_policy")
+  authzRuleId   String? @map("authz_rule_id")
+  authzReason   String? @map("authz_reason")
+
+  answers Json @default("{}")
+
+  // Validation outcome (schema-driven where possible)
+  isValid           Boolean @default(true) @map("is_valid")
+  validationResult  Json?   @map("validation_result")
+  errorCode         String? @map("error_code")
+  errorMessage      String? @map("error_message")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  prompt UserPrompt @relation(fields: [promptId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([goalRunId])
+  @@index([promptId])
+  @@index([actorId])
+  @@index([clientRequestId])
+  @@index([idempotencyKey])
+  @@index([createdAt])
+  @@map("user_prompt_attempts")
   @@schema("workflow_orchestrator")
 }
 

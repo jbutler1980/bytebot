@@ -610,6 +610,30 @@ export class GoalRunService {
       throw new NotFoundException(`Goal run ${goalRunId} not found`);
     }
 
+    // v6.0.0: Resume from WAITING_PROVIDER by unblocking provider-waiting steps.
+    // These steps were blocked after exhausting transient infra retries (capacity/gateway issues).
+    if (currentGoalRun.phase === GoalRunPhase.WAITING_PROVIDER) {
+      const unblocked = await this.prisma.checklistItem.updateMany({
+        where: {
+          status: ChecklistItemStatus.BLOCKED,
+          planVersion: { goalRunId },
+          // Machine-authored marker (no NL heuristics): set by OrchestratorLoopService.enterWaitingProvider
+          actualOutcome: { contains: 'WAITING_PROVIDER' },
+        },
+        data: {
+          status: ChecklistItemStatus.PENDING,
+          startedAt: null,
+          completedAt: null,
+        },
+      });
+
+      if (unblocked.count > 0) {
+        this.logger.log(
+          `Unblocked ${unblocked.count} WAITING_PROVIDER step(s) for goal run ${goalRunId}`,
+        );
+      }
+    }
+
     // Resume to EXECUTING if we have a plan, otherwise PLANNING
     const resumePhase = currentGoalRun.planVersions.length > 0
       ? GoalRunPhase.EXECUTING

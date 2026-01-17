@@ -109,6 +109,7 @@ type LoopAction =
   | 'VERIFY'
   | 'REPLAN'
   | 'RETRY'  // v1.1.1: Retry same step (for infrastructure failures)
+  | 'WAIT_PROVIDER' // v6.0.0: Pause safely when provider/model capacity is unavailable
   | 'WAIT_APPROVAL'
   | 'COMPLETE'
   | 'FAIL'
@@ -492,6 +493,10 @@ export class OrchestratorLoopService implements OnModuleInit, OnModuleDestroy {
         // Stable durable wait state for USER_INPUT_REQUIRED steps
         return { action: 'CONTINUE' };
 
+      case GoalRunPhase.WAITING_PROVIDER:
+        // Stable durable wait state for provider/model capacity recovery
+        return { action: 'CONTINUE' };
+
       case GoalRunPhase.INITIALIZING:
         // Only trigger PLAN for INITIALIZING phase
         // This prevents race condition where multiple iterations try to plan
@@ -664,15 +669,22 @@ export class OrchestratorLoopService implements OnModuleInit, OnModuleDestroy {
             const infraRetryCount = this.infraRetryCounts.get(failedItem.id) || 0;
 
             if (infraRetryCount >= MAX_INFRA_RETRIES) {
-              // Exhausted infra retries - escalate to replan
               this.logger.warn(
                 `Infrastructure retries exhausted (${MAX_INFRA_RETRIES}) for step ${failedItem.id}, ` +
-                `escalating to replan`
+                `entering WAITING_PROVIDER`
               );
-              // Clear infra retry tracking before escalating
+
+              // Clear infra retry tracking before pausing (resume will re-attempt)
               this.infraRetryCounts.delete(failedItem.id);
               this.infraRetryAfter.delete(failedItem.id);
-              // Fall through to replan logic below
+
+              return {
+                action: 'WAIT_PROVIDER',
+                reason:
+                  `Infrastructure retries exhausted (${MAX_INFRA_RETRIES}). ` +
+                  `Waiting for provider/model capacity to recover.`,
+                itemId: failedItem.id,
+              };
             } else {
               // Check if backoff period has elapsed
               const retryAfter = this.infraRetryAfter.get(failedItem.id) || 0;
@@ -781,6 +793,17 @@ export class OrchestratorLoopService implements OnModuleInit, OnModuleDestroy {
             decision.retryCount || 1,
             decision.retryDelayMs || INFRA_RETRY_BASE_DELAY_MS,
             decision.reason || 'Transient failure',
+          );
+        }
+        break;
+
+      case 'WAIT_PROVIDER':
+        // v6.0.0: Stable pause for provider/model capacity recovery (prevents retry storms).
+        if (decision.itemId) {
+          await this.enterWaitingProvider(
+            goalRun,
+            decision.itemId,
+            decision.reason || 'Waiting for provider/model capacity recovery',
           );
         }
         break;
@@ -1522,6 +1545,86 @@ export class OrchestratorLoopService implements OnModuleInit, OnModuleDestroy {
       `Step ${itemId} reset to PENDING for ${retryType.toLowerCase()} retry ` +
       `(will retry in ${Math.round(retryDelayMs / 1000)}s)`,
     );
+  }
+
+  /**
+   * v6.0.0: Enter a stable WAITING_PROVIDER state after exhausting transient retries.
+   *
+   * This prevents semantic replans and retry storms when the root cause is
+   * provider/model/gateway capacity rather than step logic.
+   */
+  private async enterWaitingProvider(
+    goalRun: any,
+    itemId: string,
+    reason: string,
+  ): Promise<void> {
+    const item = await this.prisma.checklistItem.findUnique({
+      where: { id: itemId },
+      select: {
+        id: true,
+        description: true,
+        status: true,
+        startedAt: true,
+        actualOutcome: true,
+      },
+    });
+
+    const stepBlocked = await this.prisma.checklistItem.updateMany({
+      where: {
+        id: itemId,
+        status: {
+          in: [ChecklistItemStatus.FAILED, ChecklistItemStatus.IN_PROGRESS],
+        },
+      },
+      data: {
+        status: ChecklistItemStatus.BLOCKED,
+        startedAt: item?.startedAt ?? new Date(),
+        completedAt: null,
+        actualOutcome: JSON.stringify(
+          {
+            blockedReason: 'WAITING_PROVIDER',
+            reason,
+            previousOutcome: item?.actualOutcome ?? null,
+          },
+          null,
+          2,
+        ),
+      },
+    });
+
+    const phaseUpdated = await this.prisma.goalRun.updateMany({
+      where: {
+        id: goalRun.id,
+        phase: {
+          in: [GoalRunPhase.EXECUTING, GoalRunPhase.CONTROLLING_DESKTOP],
+        },
+      },
+      data: { phase: GoalRunPhase.WAITING_PROVIDER },
+    });
+
+    if (stepBlocked.count > 0 || phaseUpdated.count > 0) {
+      this.eventEmitter.emit('goal-run.phase-changed', {
+        goalRunId: goalRun.id,
+        previousPhase: goalRun.phase,
+        newPhase: GoalRunPhase.WAITING_PROVIDER,
+      });
+
+      await this.goalRunService.createActivityEvent(goalRun.id, {
+        eventType: 'WAITING_PROVIDER',
+        title: 'Waiting for provider/model capacity',
+        description: reason,
+        severity: 'warning',
+        checklistItemId: itemId,
+        details: {
+          blockedReason: 'WAITING_PROVIDER',
+          lastKnownOutcome: item?.actualOutcome ?? null,
+        },
+      });
+
+      this.logger.warn(
+        `Goal run ${goalRun.id} entered WAITING_PROVIDER (step ${itemId} blocked): ${reason}`,
+      );
+    }
   }
 
   /**

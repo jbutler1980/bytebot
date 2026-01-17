@@ -102,6 +102,143 @@ export class UserPromptResolutionService {
     return { allowed: true, policy, ruleId: 'human_default', reason: 'HUMAN actor allowed' };
   }
 
+  private validateAnswersAgainstJsonSchema(jsonSchema: any, answers: Record<string, any>): {
+    isValid: boolean;
+    errors: Array<{ path: string; message: string }>;
+  } {
+    const errors: Array<{ path: string; message: string }> = [];
+
+    if (!jsonSchema || typeof jsonSchema !== 'object') {
+      return { isValid: true, errors };
+    }
+
+    if (jsonSchema.type && jsonSchema.type !== 'object') {
+      return { isValid: true, errors };
+    }
+
+    const required: string[] = Array.isArray(jsonSchema.required) ? jsonSchema.required : [];
+    const properties: Record<string, any> =
+      jsonSchema.properties && typeof jsonSchema.properties === 'object' ? jsonSchema.properties : {};
+
+    for (const key of required) {
+      const value = (answers as any)[key];
+      if (value === undefined || value === null) {
+        errors.push({ path: `/${key}`, message: 'is required' });
+        continue;
+      }
+
+      const prop = properties[key];
+      const expectedType = prop?.type;
+
+      if (expectedType === 'string') {
+        if (typeof value !== 'string') {
+          errors.push({ path: `/${key}`, message: 'must be a string' });
+          continue;
+        }
+        const minLength = typeof prop?.minLength === 'number' ? prop.minLength : undefined;
+        if (minLength !== undefined && value.trim().length < minLength) {
+          errors.push({ path: `/${key}`, message: `must be at least ${minLength} characters` });
+        }
+      }
+
+      if (expectedType === 'number' || expectedType === 'integer') {
+        if (typeof value !== 'number' || Number.isNaN(value)) {
+          errors.push({ path: `/${key}`, message: 'must be a number' });
+        }
+      }
+
+      if (expectedType === 'boolean') {
+        if (typeof value !== 'boolean') {
+          errors.push({ path: `/${key}`, message: 'must be a boolean' });
+        }
+      }
+    }
+
+    return { isValid: errors.length === 0, errors };
+  }
+
+  private async recordAttemptOnce(params: {
+    promptId: string;
+    tenantId: string;
+    goalRunId: string;
+    actor: {
+      type: ActorType;
+      id?: string;
+      email?: string;
+      name?: string;
+      authContext?: Record<string, any>;
+    };
+    answers: Record<string, any>;
+    requestId?: string;
+    clientRequestId?: string;
+    idempotencyKey?: string;
+    ipAddress?: string;
+    userAgent?: string;
+    authz: { decision: 'ALLOW' | 'DENY'; policy: string; ruleId: string; reason: string };
+    isValid: boolean;
+    validationResult?: Record<string, any> | null;
+    errorCode?: string | null;
+    errorMessage?: string | null;
+  }): Promise<void> {
+    // Idempotency: prompt-scoped; prefer idempotencyKey, fallback to clientRequestId.
+    const idempotencyKey = params.idempotencyKey ?? null;
+    const clientRequestId = params.clientRequestId ?? null;
+
+    try {
+      await this.prisma.userPromptAttempt.create({
+        data: {
+          id: createId(),
+          promptId: params.promptId,
+          tenantId: params.tenantId,
+          goalRunId: params.goalRunId,
+          actorType: params.actor.type,
+          actorId: params.actor.id,
+          actorEmail: params.actor.email,
+          actorName: params.actor.name,
+          actorIpAddress: params.ipAddress,
+          actorUserAgent: params.userAgent,
+          requestId: params.requestId,
+          authContext: params.actor.authContext ?? {},
+          clientRequestId,
+          idempotencyKey,
+          authzDecision: params.authz.decision,
+          authzPolicy: params.authz.policy,
+          authzRuleId: params.authz.ruleId,
+          authzReason: params.authz.reason,
+          answers: params.answers,
+          isValid: params.isValid,
+          validationResult: params.validationResult ?? undefined,
+          errorCode: params.errorCode ?? null,
+          errorMessage: params.errorMessage ?? null,
+        },
+      });
+    } catch (error: any) {
+      // P2002: unique constraint violation (prompt_id+idempotency_key or prompt_id+client_request_id)
+      if (error?.code !== 'P2002') {
+        throw error;
+      }
+
+      if (!idempotencyKey && !clientRequestId) {
+        // Should be unreachable, but don't loop if it happens.
+        return;
+      }
+
+      const existing = await this.prisma.userPromptAttempt.findFirst({
+        where: {
+          promptId: params.promptId,
+          OR: [
+            ...(idempotencyKey ? [{ idempotencyKey }] : []),
+            ...(clientRequestId ? [{ clientRequestId }] : []),
+          ],
+        },
+        select: { id: true },
+      });
+
+      if (existing) return;
+      throw error;
+    }
+  }
+
   async resolvePrompt(request: {
     promptId: string;
     tenantId: string;
@@ -142,6 +279,141 @@ export class UserPromptResolutionService {
 
     const { promptId } = request;
     const resolvedAt = new Date();
+
+    // Preflight: record an immutable attempt row even when we reject the submission.
+    // This is intentionally not part of the resolution transaction so validation/auth failures persist.
+    const promptForAttempt = await this.prisma.userPrompt.findUnique({
+      where: { id: promptId },
+      select: {
+        id: true,
+        tenantId: true,
+        goalRunId: true,
+        goalSpecId: true,
+        kind: true,
+        status: true,
+      },
+    });
+
+    if (!promptForAttempt) {
+      throw new NotFoundException(`UserPrompt ${promptId} not found`);
+    }
+
+    const promptTenantIdForAttempt =
+      promptForAttempt.tenantId ||
+      (
+        await this.prisma.goalRun.findUnique({
+          where: { id: promptForAttempt.goalRunId },
+          select: { tenantId: true },
+        })
+      )?.tenantId;
+
+    if (!promptTenantIdForAttempt) {
+      throw new BadRequestException(`Prompt ${promptId} is missing tenantId`);
+    }
+    if (promptTenantIdForAttempt !== request.tenantId) {
+      // Do not record attempts across tenants (avoid leaking prompt existence).
+      throw new ForbiddenException('Prompt does not belong to tenant');
+    }
+
+    const authzForAttempt = this.evaluateResolutionAuthz({
+      promptKind: promptForAttempt.kind,
+      actorType: request.actor.type,
+    });
+
+    if (!authzForAttempt.allowed) {
+      await this.recordAttemptOnce({
+        promptId,
+        tenantId: promptTenantIdForAttempt,
+        goalRunId: promptForAttempt.goalRunId,
+        actor: request.actor,
+        answers: request.answers,
+        requestId: request.requestId,
+        clientRequestId: request.clientRequestId,
+        idempotencyKey: request.idempotencyKey,
+        ipAddress: request.ipAddress,
+        userAgent: request.userAgent,
+        authz: { decision: 'DENY', policy: authzForAttempt.policy, ruleId: authzForAttempt.ruleId, reason: authzForAttempt.reason },
+        isValid: false,
+        validationResult: null,
+        errorCode: 'AUTHZ_DENY',
+        errorMessage: authzForAttempt.reason,
+      });
+      throw new ForbiddenException(authzForAttempt.reason);
+    }
+
+    if (promptForAttempt.status !== UserPromptStatus.OPEN && promptForAttempt.status !== UserPromptStatus.RESOLVED) {
+      await this.recordAttemptOnce({
+        promptId,
+        tenantId: promptTenantIdForAttempt,
+        goalRunId: promptForAttempt.goalRunId,
+        actor: request.actor,
+        answers: request.answers,
+        requestId: request.requestId,
+        clientRequestId: request.clientRequestId,
+        idempotencyKey: request.idempotencyKey,
+        ipAddress: request.ipAddress,
+        userAgent: request.userAgent,
+        authz: { decision: 'ALLOW', policy: authzForAttempt.policy, ruleId: authzForAttempt.ruleId, reason: authzForAttempt.reason },
+        isValid: false,
+        validationResult: null,
+        errorCode: 'PROMPT_NOT_OPEN',
+        errorMessage: `Prompt is not OPEN (status=${promptForAttempt.status})`,
+      });
+      throw new ConflictException(`Prompt ${promptId} is not OPEN (status=${promptForAttempt.status})`);
+    }
+
+    // Schema validation (GoalSpec-backed prompts only): reject invalid attempts but keep prompt OPEN.
+    if (promptForAttempt.goalSpecId) {
+      const goalSpec = await this.prisma.goalSpec.findUnique({
+        where: { id: promptForAttempt.goalSpecId },
+        select: { jsonSchema: true },
+      });
+
+      const { isValid, errors } = this.validateAnswersAgainstJsonSchema(goalSpec?.jsonSchema as any, request.answers);
+      if (!isValid) {
+        const validationResult = { schema: 'jsonschema.required+types.v1', errors };
+        await this.recordAttemptOnce({
+          promptId,
+          tenantId: promptTenantIdForAttempt,
+          goalRunId: promptForAttempt.goalRunId,
+          actor: request.actor,
+          answers: request.answers,
+          requestId: request.requestId,
+          clientRequestId: request.clientRequestId,
+          idempotencyKey: request.idempotencyKey,
+          ipAddress: request.ipAddress,
+          userAgent: request.userAgent,
+          authz: { decision: 'ALLOW', policy: authzForAttempt.policy, ruleId: authzForAttempt.ruleId, reason: authzForAttempt.reason },
+          isValid: false,
+          validationResult,
+          errorCode: 'SCHEMA_VALIDATION_FAILED',
+          errorMessage: 'Schema validation failed',
+        });
+        throw new BadRequestException({
+          message: 'Schema validation failed',
+          errors,
+        });
+      }
+    }
+
+    // Record accepted attempt (append-only).
+    await this.recordAttemptOnce({
+      promptId,
+      tenantId: promptTenantIdForAttempt,
+      goalRunId: promptForAttempt.goalRunId,
+      actor: request.actor,
+      answers: request.answers,
+      requestId: request.requestId,
+      clientRequestId: request.clientRequestId,
+      idempotencyKey: request.idempotencyKey,
+      ipAddress: request.ipAddress,
+      userAgent: request.userAgent,
+      authz: { decision: 'ALLOW', policy: authzForAttempt.policy, ruleId: authzForAttempt.ruleId, reason: authzForAttempt.reason },
+      isValid: true,
+      validationResult: null,
+      errorCode: null,
+      errorMessage: null,
+    });
 
     const result = await this.prisma.$transaction(async (tx) => {
       // Lock the prompt row to ensure OPEN->RESOLVED is serialized across concurrent resolvers.

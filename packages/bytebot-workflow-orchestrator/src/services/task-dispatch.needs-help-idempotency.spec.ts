@@ -34,7 +34,9 @@ describe('TaskDispatchService NEEDS_HELP idempotency', () => {
     } as any;
 
     const userPromptService = {
-      buildDedupeKey: jest.fn((goalRunId: string, stepId: string, kind: string) => `prompt:${goalRunId}:${stepId}:${kind}`),
+      buildDedupeKey: jest.fn(
+        (goalRunId: string, stepId: string, kind: string) => `prompt:${goalRunId}:${stepId}:${kind}`,
+      ),
       ensureOpenPromptForStep: jest.fn(),
     } as any;
 
@@ -56,14 +58,10 @@ describe('TaskDispatchService NEEDS_HELP idempotency', () => {
     // Avoid deep DB activity plumbing; focus on idempotency behavior
     (service as any).emitActivityEvent = jest.fn();
 
-    prisma.checklistItem.updateMany
-      .mockResolvedValueOnce({ count: 1 })
-      .mockResolvedValueOnce({ count: 0 });
+    prisma.checklistItem.updateMany.mockResolvedValueOnce({ count: 1 }).mockResolvedValueOnce({ count: 0 });
     prisma.userPrompt.findUnique.mockResolvedValue(null);
     prisma.goalRun.findUnique.mockResolvedValue({ phase: GoalRunPhase.EXECUTING, tenantId: 't-1' });
-    prisma.goalRun.updateMany
-      .mockResolvedValueOnce({ count: 1 })
-      .mockResolvedValueOnce({ count: 0 });
+    prisma.goalRun.updateMany.mockResolvedValueOnce({ count: 1 }).mockResolvedValueOnce({ count: 0 });
 
     userPromptService.ensureOpenPromptForStep.mockResolvedValue({
       id: 'p-1',
@@ -146,7 +144,9 @@ describe('TaskDispatchService NEEDS_HELP idempotency', () => {
     } as any;
 
     const userPromptService = {
-      buildDedupeKey: jest.fn((goalRunId: string, stepId: string, kind: string) => `prompt:${goalRunId}:${stepId}:${kind}`),
+      buildDedupeKey: jest.fn(
+        (goalRunId: string, stepId: string, kind: string) => `prompt:${goalRunId}:${stepId}:${kind}`,
+      ),
       ensureOpenPromptForStep: jest.fn(),
     } as any;
 
@@ -168,14 +168,10 @@ describe('TaskDispatchService NEEDS_HELP idempotency', () => {
     // Avoid deep DB activity plumbing; focus on idempotency behavior
     (service as any).emitActivityEvent = jest.fn();
 
-    prisma.checklistItem.updateMany
-      .mockResolvedValueOnce({ count: 1 })
-      .mockResolvedValueOnce({ count: 0 });
+    prisma.checklistItem.updateMany.mockResolvedValueOnce({ count: 1 }).mockResolvedValueOnce({ count: 0 });
     prisma.userPrompt.findUnique.mockResolvedValue(null);
     prisma.goalRun.findUnique.mockResolvedValue({ phase: GoalRunPhase.EXECUTING, tenantId: 't-1' });
-    prisma.goalRun.updateMany
-      .mockResolvedValueOnce({ count: 1 })
-      .mockResolvedValueOnce({ count: 0 });
+    prisma.goalRun.updateMany.mockResolvedValueOnce({ count: 1 }).mockResolvedValueOnce({ count: 0 });
 
     userPromptService.ensureOpenPromptForStep.mockResolvedValue({
       id: 'p-1',
@@ -268,7 +264,9 @@ describe('TaskDispatchService NEEDS_HELP idempotency', () => {
     } as any;
 
     const userPromptService = {
-      buildDedupeKey: jest.fn((goalRunId: string, stepId: string, kind: string) => `prompt:${goalRunId}:${stepId}:${kind}`),
+      buildDedupeKey: jest.fn(
+        (goalRunId: string, stepId: string, kind: string) => `prompt:${goalRunId}:${stepId}:${kind}`,
+      ),
       ensureOpenPromptForStep: jest.fn(),
       ensureOpenPromptForStepKey: jest.fn(),
     } as any;
@@ -297,9 +295,7 @@ describe('TaskDispatchService NEEDS_HELP idempotency', () => {
       executionEngine: GoalRunExecutionEngine.TEMPORAL_WORKFLOW,
     });
     prisma.userPrompt.findUnique.mockResolvedValue(null);
-    prisma.goalRun.updateMany
-      .mockResolvedValueOnce({ count: 1 })
-      .mockResolvedValueOnce({ count: 0 });
+    prisma.goalRun.updateMany.mockResolvedValueOnce({ count: 1 }).mockResolvedValueOnce({ count: 0 });
 
     userPromptService.ensureOpenPromptForStepKey.mockResolvedValue({
       id: 'p-1',
@@ -382,7 +378,9 @@ describe('TaskDispatchService NEEDS_HELP idempotency', () => {
     } as any;
 
     const userPromptService = {
-      buildDedupeKey: jest.fn((goalRunId: string, stepId: string, kind: string) => `prompt:${goalRunId}:${stepId}:${kind}`),
+      buildDedupeKey: jest.fn(
+        (goalRunId: string, stepId: string, kind: string) => `prompt:${goalRunId}:${stepId}:${kind}`,
+      ),
       ensureOpenPromptForStep: jest.fn(),
     } as any;
 
@@ -449,5 +447,91 @@ describe('TaskDispatchService NEEDS_HELP idempotency', () => {
     expect((service as any).emitActivityEvent).not.toHaveBeenCalled();
     expect((service as any).taskControllerClient.delete).not.toHaveBeenCalled();
     expect((service as any).taskControllerClient.post).not.toHaveBeenCalled();
+  });
+
+  it('does not create a user prompt for internal desktop safety interrupts', async () => {
+    const prisma = {
+      checklistItem: {
+        update: jest.fn(),
+      },
+    } as any;
+
+    const dbTransientService = {
+      isInBackoff: jest.fn(() => false),
+      getBackoffRemainingMs: jest.fn(() => 0),
+      withTransientGuard: jest.fn(async (fn: any) => fn()),
+    } as any;
+
+    const configService = {
+      get: jest.fn((_key: string, fallback: string) => fallback),
+    } as any;
+
+    const eventEmitter = {
+      emit: jest.fn(),
+    } as any;
+
+    const userPromptService = {
+      ensureOpenPromptForStep: jest.fn(),
+    } as any;
+
+    const outboxService = {
+      enqueueOnce: jest.fn(),
+    } as any;
+
+    const service = new TaskDispatchService(
+      configService,
+      prisma,
+      dbTransientService,
+      eventEmitter,
+      userPromptService,
+      outboxService,
+    );
+
+    // Avoid deep DB activity plumbing; focus on classification behavior
+    (service as any).emitActivityEvent = jest.fn();
+
+    const record: any = {
+      idempotencyKey: 'gr-1:ci-1:1',
+      taskId: 't-1',
+      goalRunId: 'gr-1',
+      checklistItemId: 'ci-1',
+      status: 'RUNNING',
+      createdAt: new Date(),
+      consecutiveCheckFailures: 0,
+      notFoundCount: 0,
+      isHeartbeatHealthy: true,
+      consecutiveHeartbeatUnhealthy: 0,
+    };
+
+    const task: any = {
+      id: 't-1',
+      status: 'NEEDS_HELP',
+      title: 'Desktop loop detected',
+      requiresDesktop: true,
+      result: {
+        errorCode: 'LOOP_DETECTED_NO_PROGRESS',
+        message: 'Desktop automation appears stuck.',
+        details: { repeatThreshold: 5 },
+      },
+      error: null,
+    };
+
+    await (service as any).handleTaskNeedsHelp(record, task);
+
+    expect(record.status).toBe('FAILED');
+    expect(userPromptService.ensureOpenPromptForStep).not.toHaveBeenCalled();
+    expect(outboxService.enqueueOnce).not.toHaveBeenCalled();
+    expect((service as any).emitActivityEvent).toHaveBeenCalledWith(
+      record.goalRunId,
+      'ERROR',
+      expect.any(String),
+      expect.objectContaining({ checklistItemId: record.checklistItemId }),
+    );
+    expect(prisma.checklistItem.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: record.checklistItemId },
+        data: expect.objectContaining({ status: 'FAILED' }),
+      }),
+    );
   });
 });

@@ -48,7 +48,7 @@ import { OutboxService } from './outbox.service';
 //
 // Routes tasks to appropriate in-house models based on execution surface:
 // - Browser tasks (requiresDesktop: false) → gpt-oss-120b (high-capability reasoning)
-// - Desktop tasks (requiresDesktop: true) → qwen3-vl-32b (vision-capable for GUI)
+// - Desktop tasks (requiresDesktop: true) → desktop-vision (vision-capable model group with fallbacks)
 // - Fallback → claude-sonnet-4-5 (external API for complex reasoning)
 //
 // Model configuration for bytebot-agent's task schema
@@ -60,8 +60,10 @@ const BROWSER_TASK_MODEL = {
 };
 
 const DESKTOP_TASK_MODEL = {
-  name: 'openai/qwen3-vl-32b',
-  title: 'qwen3-vl-32b',
+  // IMPORTANT: Use the model group alias (not a single backend) to ensure fallbacks are always enabled.
+  // See: docs/bytebot/contracts/VISION_MODEL_GROUPS.md
+  name: 'desktop-vision',
+  title: 'desktop-vision',
   provider: 'proxy',
   contextWindow: 32000,
 };
@@ -153,6 +155,12 @@ interface AgentTask {
   createdAt: string;
   completedAt?: string;
 }
+
+type NeedsHelpResult = {
+  errorCode?: string;
+  message?: string;
+  details?: Record<string, unknown>;
+};
 
 // Task dispatch result
 interface TaskDispatchResult {
@@ -307,18 +315,18 @@ export class TaskDispatchService implements OnModuleInit {
    * Phase 12: Select model based on task execution surface
    *
    * Routes tasks to appropriate in-house models:
-   * - Desktop tasks (requiresDesktop: true) → qwen3-vl-32b (vision model for GUI)
-   * - Browser tasks (requiresDesktop: false) → fara-7b (optimized for web)
+   * - Desktop tasks (requiresDesktop: true) → desktop-vision (vision model group with fallbacks)
+   * - Browser tasks (requiresDesktop: false) → gpt-oss-120b (optimized for web)
    * - Fallback when surface unspecified → claude-sonnet-4-5
    */
   private selectModelForTask(requiresDesktop?: boolean): typeof BROWSER_TASK_MODEL {
     if (requiresDesktop === true) {
-      this.logger.debug('Selected DESKTOP_TASK_MODEL (qwen3-vl-32b) for desktop task');
+      this.logger.debug('Selected DESKTOP_TASK_MODEL (desktop-vision) for desktop task');
       return DESKTOP_TASK_MODEL;
     }
 
     if (requiresDesktop === false) {
-      this.logger.debug('Selected BROWSER_TASK_MODEL (fara-7b) for browser task');
+      this.logger.debug('Selected BROWSER_TASK_MODEL (gpt-oss-120b) for browser task');
       return BROWSER_TASK_MODEL;
     }
 
@@ -669,7 +677,8 @@ export class TaskDispatchService implements OnModuleInit {
 
         // Handle semantic failure (task actually failed, not infra issue)
         if (task.status === 'FAILED' || task.status === 'CANCELLED') {
-          await this.handleTaskFailed(record, task.error, task.title, 'SEMANTIC');
+          const failureType = this.classifyFailureType(task);
+          await this.handleTaskFailed(record, task.error, task.title, failureType);
         }
 
         // v2.4.0: Handle NEEDS_HELP status - task paused for user input
@@ -834,6 +843,71 @@ export class TaskDispatchService implements OnModuleInit {
   }
 
   /**
+   * v6.0.0: Classify agent task failure type (SEMANTIC vs INFRASTRUCTURE).
+   *
+   * Contract:
+   * - Connection errors, timeouts, provider overload, and gateway/model unavailability are INFRASTRUCTURE.
+   * - Tool/logic failures are SEMANTIC.
+   */
+  private classifyFailureType(task: AgentTask): FailureType {
+    // Cancellations are usually intentional; treat as semantic unless explicit infra marker exists.
+    const error = String(task.error || '');
+    const lower = error.toLowerCase();
+
+    // Explicit machine marker (preferred over pattern matching).
+    if (lower.includes('[infra]')) return 'INFRASTRUCTURE';
+
+    const result = (task.result || {}) as any;
+    const errorCategory = typeof result.errorCategory === 'string' ? result.errorCategory : '';
+    const errorCode = typeof result.errorCode === 'string' ? result.errorCode : '';
+
+    if (
+      ['INFRA', 'TRANSIENT_INFRA', 'PROVIDER_UNAVAILABLE', 'CAPACITY_EXHAUSTED'].includes(
+        String(errorCategory),
+      )
+    ) {
+      return 'INFRASTRUCTURE';
+    }
+
+    const combined = `${lower} ${String(errorCategory).toLowerCase()} ${String(errorCode).toLowerCase()}`;
+    const infraPatterns = [
+      // Network/timeouts
+      'econnrefused',
+      'etimedout',
+      'enotfound',
+      'econnreset',
+      'socket hang up',
+      'network error',
+      'fetch failed',
+      'connection refused',
+      'timeout',
+
+      // Provider/gateway unavailability
+      'service unavailable',
+      'bad gateway',
+      'gateway',
+      'litellm',
+      'circuit breaker open',
+      'overloaded',
+      'rate limit',
+      'no available',
+      'capacity',
+      'model group',
+
+      // Common HTTP status signals
+      ' 502 ',
+      ' 503 ',
+      ' 504 ',
+    ];
+
+    if (infraPatterns.some((p) => combined.includes(p))) {
+      return 'INFRASTRUCTURE';
+    }
+
+    return 'SEMANTIC';
+  }
+
+  /**
    * v2.4.0: Handle task transitioned to NEEDS_HELP status
    *
    * When a task asks for user help (e.g., Claude asks for clarification):
@@ -853,6 +927,31 @@ export class TaskDispatchService implements OnModuleInit {
     // Side effects (activity, outbox) must happen once only, guarded by the durable transition.
     if (record.status === 'WAITING_USER') return;
 
+    const needsHelp = this.extractNeedsHelpResult(task);
+    const needsHelpCode = needsHelp?.errorCode ?? null;
+
+    // Gold-Standard policy: Never convert internal strategy/runtime failures into a user prompt.
+    // Only create durable user prompts for cases that genuinely require external input or human action.
+    //
+    // If the agent provides a structured NeedsHelpResult.errorCode, we can deterministically classify it.
+    // Backward-compat: if no errorCode exists (older agents), fall back to the legacy prompt behavior.
+    if (needsHelpCode) {
+      const classification = this.classifyNeedsHelpHandling(needsHelpCode);
+
+      if (classification.handling !== 'USER_PROMPT') {
+        const message = this.formatNeedsHelpFailureMessage(needsHelp, needsHelpCode);
+
+        if (classification.handling === 'INFRA_FAILURE') {
+          await this.markAsInfrastructureFailure(record, message);
+          return;
+        }
+
+        await this.handleTaskFailed(record, message, task.title, 'SEMANTIC');
+        return;
+      }
+    }
+
+    this.logger.log(`Task ${record.taskId} needs user help for item ${record.checklistItemId}`);
     const promptKind = task.requiresDesktop
       ? UserPromptKind.DESKTOP_TAKEOVER
       : UserPromptKind.TEXT_CLARIFICATION;
@@ -1073,6 +1172,54 @@ export class TaskDispatchService implements OnModuleInit {
       taskId: record.taskId,
       reason: 'Task requires user input to continue',
     });
+  }
+
+  private extractNeedsHelpResult(task: AgentTask): NeedsHelpResult | null {
+    const raw = task.result;
+    if (!raw || typeof raw !== 'object') return null;
+
+    const result = raw as NeedsHelpResult;
+    if (typeof result.errorCode !== 'string' || result.errorCode.trim().length === 0) {
+      return null;
+    }
+
+    return result;
+  }
+
+  private classifyNeedsHelpHandling(errorCode: string): { handling: 'USER_PROMPT' | 'SEMANTIC_FAILURE' | 'INFRA_FAILURE' } {
+    // User prompts are reserved for true external input / takeover scenarios.
+    // Everything else must be handled internally (retry/replan/pause) without spamming prompts.
+    const userPromptCodes = new Set<string>([
+      'DISPATCHED_USER_PROMPT_STEP',
+      'AGENT_REQUESTED_HELP',
+      'UI_BLOCKED_SIGNIN',
+      'UI_BLOCKED_POPUP',
+    ]);
+
+    if (userPromptCodes.has(errorCode)) {
+      return { handling: 'USER_PROMPT' };
+    }
+
+    const infraCodes = new Set<string>([
+      'WAITING_PROVIDER',
+      'LLM_EMPTY_RESPONSE',
+      'UI_OBSERVATION_FAILED',
+    ]);
+
+    if (infraCodes.has(errorCode)) {
+      return { handling: 'INFRA_FAILURE' };
+    }
+
+    // Default: treat as semantic failure and let the orchestrator replan (internal strategy), not prompt the user.
+    return { handling: 'SEMANTIC_FAILURE' };
+  }
+
+  private formatNeedsHelpFailureMessage(needsHelp: NeedsHelpResult | null, errorCode: string): string {
+    const message = typeof needsHelp?.message === 'string' ? needsHelp.message.trim() : '';
+    if (message) {
+      return `NEEDS_HELP(${errorCode}): ${message}`;
+    }
+    return `NEEDS_HELP(${errorCode})`;
   }
 
   /**
