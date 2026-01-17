@@ -46,7 +46,7 @@ import { PrismaService } from '../services/prisma.service';
 import { GoalIntakeService } from '../services/goal-intake.service';
 import { detectPlannerFirstStepUserInputReason, PlannerFirstStepUserInputError } from '../services/planner.errors';
 import { ExecutionSurface, StepType } from '@prisma/client';
-import { normalizeSuggestedToolsOrThrow, PlannerOutputContractViolationError } from '../contracts/planner-tools';
+import { hasDesktopExecutionTool, normalizeSuggestedToolsOrThrow, PlannerOutputContractViolationError } from '../contracts/planner-tools';
 
 // ============================================================================
 // DTOs
@@ -315,27 +315,35 @@ export class InternalController {
     });
 
     try {
-      // Resolve execution surface deterministically (structured signals only; no NL heuristics).
-      // Temporal worker v1 StepDto may omit surface fields; use workspace presence as the safest default.
-      const resolvedExecutionSurface =
-        body.step.executionSurface ??
-        (typeof body.step.requiresDesktop === 'boolean'
-          ? body.step.requiresDesktop
-            ? ExecutionSurface.DESKTOP
-            : ExecutionSurface.TEXT_ONLY
-          : body.workspaceId
-            ? ExecutionSurface.DESKTOP
-            : ExecutionSurface.TEXT_ONLY);
-
-      const resolvedRequiresDesktop =
-        typeof body.step.requiresDesktop === 'boolean'
-          ? body.step.requiresDesktop
-          : resolvedExecutionSurface === ExecutionSurface.DESKTOP;
-
       const normalizedSuggestedTools = normalizeSuggestedToolsOrThrow({
         suggestedTools: body.step.suggestedTools,
         allowedTools: null,
       });
+
+      // Resolve execution surface deterministically (structured signals only; no NL heuristics).
+      // Temporal worker v1 StepDto may omit surface fields; use workspace presence as the safest default.
+      const inferredRequiresDesktop =
+        typeof body.step.requiresDesktop === 'boolean'
+          ? body.step.requiresDesktop
+          : hasDesktopExecutionTool(normalizedSuggestedTools) || !!body.workspaceId;
+
+      let resolvedExecutionSurface =
+        body.step.executionSurface ??
+        (inferredRequiresDesktop ? ExecutionSurface.DESKTOP : ExecutionSurface.TEXT_ONLY);
+
+      // Feasibility gate: do not allow TEXT_ONLY dispatch when desktop execution is required.
+      if (resolvedExecutionSurface === ExecutionSurface.TEXT_ONLY && inferredRequiresDesktop) {
+        this.logger.warn({
+          message: 'Feasibility auto-upgrade: step requires DESKTOP but was TEXT_ONLY',
+          goalRunId: body.goalRunId,
+          stepNumber: body.step.stepNumber,
+          workspaceId: body.workspaceId ?? null,
+          suggestedTools: normalizedSuggestedTools,
+        });
+        resolvedExecutionSurface = ExecutionSurface.DESKTOP;
+      }
+
+      const resolvedRequiresDesktop = resolvedExecutionSurface === ExecutionSurface.DESKTOP;
 
       // Get goal context for richer agent context
       const goalRun = await this.prisma.goalRun.findUnique({

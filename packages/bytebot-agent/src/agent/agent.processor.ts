@@ -54,7 +54,32 @@ import {
   resolveExecutionSurface,
   shouldAcquireDesktop,
 } from './execution-surface';
-import { buildNeedsHelpResult } from './needs-help';
+import { buildNeedsHelpResult, parseNeedsHelpErrorCode } from './needs-help';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+import {
+  DESKTOP_MAX_ACTIONS_WITHOUT_OBSERVATION,
+  DESKTOP_LOOP_NO_CHANGE_MAX_HAMMING,
+  DESKTOP_LOOP_REPEAT_THRESHOLD,
+  DESKTOP_TOOL_CONTRACT_VIOLATION_LIMIT,
+  DesktopLoopDetector,
+  normalizeComputerToolUseBlock,
+} from './agent.desktop-safety';
+import { resetDesktopInput } from './agent.computer-use';
+
+const DESKTOP_OBSERVATION_REQUIRED_TOOLS = new Set([
+  'computer_move_mouse',
+  'computer_trace_mouse',
+  'computer_click_mouse',
+  'computer_press_mouse',
+  'computer_drag_mouse',
+  'computer_scroll',
+  'computer_type_keys',
+  'computer_press_keys',
+  'computer_type_text',
+  'computer_paste_text',
+  'computer_wait',
+  'computer_application',
+]);
 
 @Injectable()
 export class AgentProcessor {
@@ -65,6 +90,11 @@ export class AgentProcessor {
   private services: Record<string, BytebotAgentService> = {};
   // v2.2.1: Track cached desktop URL per task to avoid repeated waits
   private cachedDesktopUrl: string | null = null;
+  private desktopLoopDetector = new DesktopLoopDetector();
+  private desktopToolContractViolations = 0;
+  private desktopActionsWithoutObservation = 0;
+  private pendingDesktopNeedsHelp: ReturnType<typeof buildNeedsHelpResult> | null =
+    null;
   // v2.2.7: Mutex to prevent concurrent iteration execution
   // This prevents race conditions where multiple LLM calls could be made simultaneously
   // See: 2025-12-09-race-condition-duplicate-llm-calls-fix.md
@@ -133,6 +163,7 @@ export class AgentProcessor {
     private readonly actionLoggingService: ActionLoggingService,
     // v2.3.0 M4: WorkspaceService for persistent workspace resolution and locking
     private readonly workspaceService: WorkspaceService,
+    private readonly eventEmitter: EventEmitter2,
   ) {
     this.services = {
       anthropic: this.anthropicService,
@@ -214,6 +245,10 @@ export class AgentProcessor {
     this.abortController = new AbortController();
     // v2.2.1: Reset cached desktop URL for new task
     this.cachedDesktopUrl = null;
+    this.desktopLoopDetector = new DesktopLoopDetector();
+    this.desktopToolContractViolations = 0;
+    this.desktopActionsWithoutObservation = 0;
+    this.pendingDesktopNeedsHelp = null;
 
     // Phase 6.4: Start heartbeat for this task
     this.taskControllerService.startHeartbeat(taskId);
@@ -619,6 +654,8 @@ export class AgentProcessor {
           desktopUrl,
           requiresDesktop: task.requiresDesktop,
           onAction: (action: ActionResult) => {
+            this.handleDesktopSafetyAction(action);
+
             // Log action asynchronously (non-blocking)
             const logEntry: ActionLogEntry = {
               taskId,
@@ -664,8 +701,52 @@ export class AgentProcessor {
         try {
           for (const block of messageContentBlocks) {
             if (isComputerToolUseContentBlock(block)) {
-              const result = await handleComputerToolUse(block, this.logger, actionContext);
+              const normalized = normalizeComputerToolUseBlock(block);
+
+              if (
+                normalized.rewriteReason === 'non_modifier_down_to_tap' ||
+                normalized.rewriteReason === 'modifier_down_missing_holdms_to_tap'
+              ) {
+                this.desktopToolContractViolations++;
+                const rewrittenKeys = normalized.rewrittenKeys || [];
+                for (const key of rewrittenKeys) {
+                  this.eventEmitter.emit('desktop.keydown.rewritten', {
+                    key,
+                    reason: normalized.rewriteReason,
+                  });
+                }
+
+                if (
+                  this.desktopToolContractViolations >=
+                    DESKTOP_TOOL_CONTRACT_VIOLATION_LIMIT &&
+                  !this.pendingDesktopNeedsHelp
+                ) {
+                  this.pendingDesktopNeedsHelp = buildNeedsHelpResult({
+                    errorCode: 'TOOL_CONTRACT_VIOLATION',
+                    details: {
+                      violations: this.desktopToolContractViolations,
+                      limit: DESKTOP_TOOL_CONTRACT_VIOLATION_LIMIT,
+                      lastRewriteReason: normalized.rewriteReason,
+                      lastRewrittenKeys: rewrittenKeys,
+                      recentActions: this.desktopLoopDetector.getRecent(),
+                    },
+                  });
+                  this.eventEmitter.emit('desktop.interrupt', {
+                    reasonCode: 'TOOL_CONTRACT_VIOLATION',
+                  });
+                }
+              }
+
+              const result = await handleComputerToolUse(
+                normalized.normalizedBlock,
+                this.logger,
+                actionContext,
+              );
               generatedToolResults.push(result);
+
+              if (this.pendingDesktopNeedsHelp) {
+                break;
+              }
             }
 
             if (isCreateTaskToolUseBlock(block)) {
@@ -727,6 +808,29 @@ export class AgentProcessor {
           });
         }
 
+        if (this.pendingDesktopNeedsHelp) {
+          // Best-effort cleanup: release any potentially stuck keys/buttons before yielding.
+          if (desktopUrl) {
+            try {
+              await resetDesktopInput(desktopUrl);
+            } catch (error: any) {
+              this.logger.warn(
+                `Failed to reset desktop input for task ${taskId}: ${error.message}`,
+              );
+            }
+          }
+
+          await this.tasksService.update(taskId, {
+            status: TaskStatus.NEEDS_HELP,
+            result: this.pendingDesktopNeedsHelp,
+          });
+          await this.tasksService.clearLease(taskId);
+          this.taskControllerService.stopHeartbeat(taskId);
+          this.isProcessing = false;
+          this.currentTaskId = null;
+          return;
+        }
+
         // Update the task status after all tool results have been generated if we have a set task status tool use block
         if (setTaskStatusToolUseBlock) {
           switch (setTaskStatusToolUseBlock.input.status) {
@@ -748,11 +852,36 @@ export class AgentProcessor {
               this.taskControllerService.stopHeartbeat(taskId);
               break;
             case 'needs_help':
+              const rawErrorCode = (setTaskStatusToolUseBlock.input as any)?.errorCode;
+              const requestedErrorCode = parseNeedsHelpErrorCode(rawErrorCode);
+              const detailsRaw = (setTaskStatusToolUseBlock.input as any)?.details;
+              const details =
+                detailsRaw && typeof detailsRaw === 'object'
+                  ? (detailsRaw as Record<string, unknown>)
+                  : undefined;
+
+              let errorCode =
+                requestedErrorCode ?? 'CONTRACT_VIOLATION_UNTYPED_NEEDS_HELP';
+
+              // Strategy prompts must never block execution; treat generic asks as contract violations.
+              if (errorCode === 'AGENT_REQUESTED_HELP') {
+                errorCode = 'CONTRACT_VIOLATION_STRATEGY_AS_HELP';
+              }
+
+              const mergedDetails: Record<string, unknown> = {
+                ...(details || {}),
+                ...(typeof rawErrorCode === 'string' && rawErrorCode.trim()
+                  ? { rawErrorCode: rawErrorCode.trim() }
+                  : {}),
+              };
+
               await this.tasksService.update(taskId, {
                 status: TaskStatus.NEEDS_HELP,
                 result: buildNeedsHelpResult({
-                  errorCode: 'AGENT_REQUESTED_HELP',
+                  errorCode,
                   message: setTaskStatusToolUseBlock.input.description,
+                  details:
+                    Object.keys(mergedDetails).length > 0 ? mergedDetails : undefined,
                 }),
               });
               // v2.2.5: Clear lease when escalating to user
@@ -831,6 +960,67 @@ export class AgentProcessor {
 
       this.logger.debug(`[${iterationId}] Iteration completed for task ${taskId}`);
     }); // End of runExclusive
+  }
+
+  private handleDesktopSafetyAction(action: ActionResult): void {
+    if (this.pendingDesktopNeedsHelp) {
+      return;
+    }
+
+    const isUiAffecting = DESKTOP_OBSERVATION_REQUIRED_TOOLS.has(action.actionType);
+
+    const hasObservation = action.screenshotCaptured === true;
+
+    if (hasObservation || action.actionType === 'computer_screenshot') {
+      this.desktopActionsWithoutObservation = 0;
+    } else if (isUiAffecting) {
+      this.desktopActionsWithoutObservation++;
+    }
+
+    if (
+      isUiAffecting &&
+      this.desktopActionsWithoutObservation >= DESKTOP_MAX_ACTIONS_WITHOUT_OBSERVATION
+    ) {
+      this.pendingDesktopNeedsHelp = buildNeedsHelpResult({
+        errorCode: 'UI_OBSERVATION_FAILED',
+        details: {
+          actionsWithoutObservation: this.desktopActionsWithoutObservation,
+          limit: DESKTOP_MAX_ACTIONS_WITHOUT_OBSERVATION,
+          lastActionType: action.actionType,
+          lastSignature: action.actionSignature,
+        },
+      });
+      this.eventEmitter.emit('desktop.interrupt', {
+        reasonCode: 'UI_OBSERVATION_FAILED',
+      });
+      return;
+    }
+
+    if (!isUiAffecting || typeof action.actionSignature !== 'string') {
+      return;
+    }
+
+    const loop = this.desktopLoopDetector.record({
+      atMs: Date.now(),
+      signature: action.actionSignature,
+      screenshotHash: action.screenshotHash ?? null,
+    });
+
+    if (loop.interrupt) {
+      this.pendingDesktopNeedsHelp = buildNeedsHelpResult({
+        errorCode: 'LOOP_DETECTED_NO_PROGRESS',
+        details: {
+          rule: loop.rule,
+          recentActions: this.desktopLoopDetector.getRecent(),
+          noChangeMaxHamming: DESKTOP_LOOP_NO_CHANGE_MAX_HAMMING,
+          repeatThreshold: DESKTOP_LOOP_REPEAT_THRESHOLD,
+        },
+      });
+      this.eventEmitter.emit('desktop.loop.detected', { rule: loop.rule || 'unknown' });
+      this.eventEmitter.emit('desktop.interrupt', {
+        reasonCode: 'LOOP_DETECTED_NO_PROGRESS',
+      });
+    }
   }
 
   async stopProcessing(): Promise<void> {

@@ -162,6 +162,17 @@ type NeedsHelpResult = {
   details?: Record<string, unknown>;
 };
 
+const CONTRACT_VIOLATION_UNTYPED_NEEDS_HELP = 'CONTRACT_VIOLATION_UNTYPED_NEEDS_HELP';
+const CONTRACT_VIOLATION_STRATEGY_AS_HELP = 'CONTRACT_VIOLATION_STRATEGY_AS_HELP';
+
+const STRATEGY_DEFAULT_MARKER = '[ByteBot Policy] Strategy default';
+
+type StrategyDefaultDecision = {
+  key: string;
+  name: string;
+  url: string;
+};
+
 // Task dispatch result
 interface TaskDispatchResult {
   success: boolean;
@@ -927,34 +938,77 @@ export class TaskDispatchService implements OnModuleInit {
     // Side effects (activity, outbox) must happen once only, guarded by the durable transition.
     if (record.status === 'WAITING_USER') return;
 
-    const needsHelp = this.extractNeedsHelpResult(task);
-    const needsHelpCode = needsHelp?.errorCode ?? null;
+    const needsHelp = this.normalizeNeedsHelpResult(task);
 
-    // Gold-Standard policy: Never convert internal strategy/runtime failures into a user prompt.
-    // Only create durable user prompts for cases that genuinely require external input or human action.
-    //
-    // If the agent provides a structured NeedsHelpResult.errorCode, we can deterministically classify it.
-    // Backward-compat: if no errorCode exists (older agents), fall back to the legacy prompt behavior.
-    if (needsHelpCode) {
-      const classification = this.classifyNeedsHelpHandling(needsHelpCode);
+    // Gold invariant: strategy must never block progress.
+    // If the agent attempted to ask a strategy question (deprecated), we auto-resolve to a safe default
+    // and retry the step without consuming replan budget.
+    if (needsHelp.errorCode === CONTRACT_VIOLATION_STRATEGY_AS_HELP) {
+      const handled = await this.autoResolveStrategyAndRetry(record, needsHelp);
+      if (handled) return;
+    }
 
-      if (classification.handling !== 'USER_PROMPT') {
-        const message = this.formatNeedsHelpFailureMessage(needsHelp, needsHelpCode);
+    const classification = this.classifyNeedsHelpHandling(needsHelp.errorCode);
 
-        if (classification.handling === 'INFRA_FAILURE') {
-          await this.markAsInfrastructureFailure(record, message);
-          return;
-        }
+    // Feasibility gate (Atom 4): if a TEXT_ONLY task tries to use desktop tools, auto-upgrade the step to DESKTOP
+    // and rely on the existing infra-retry mechanism to re-dispatch without consuming replan budget.
+    if (
+      needsHelp.errorCode === 'DESKTOP_NOT_ALLOWED' &&
+      typeof record.checklistItemId === 'string' &&
+      record.checklistItemId.startsWith('ci-')
+    ) {
+      const upgraded = await this.prisma.checklistItem.updateMany({
+        where: {
+          id: record.checklistItemId,
+          requiresDesktop: false,
+        },
+        data: {
+          requiresDesktop: true,
+          executionSurface: ExecutionSurface.DESKTOP,
+        },
+      });
 
-        await this.handleTaskFailed(record, message, task.title, 'SEMANTIC');
+      if (upgraded.count > 0) {
+        await this.emitActivityEvent(
+          record.goalRunId,
+          'EXECUTION_SURFACE_UPGRADED',
+          'Auto-upgraded execution surface to DESKTOP',
+          {
+            checklistItemId: record.checklistItemId,
+            taskId: record.taskId,
+            from: ExecutionSurface.TEXT_ONLY,
+            to: ExecutionSurface.DESKTOP,
+            reasonCode: needsHelp.errorCode,
+          },
+        );
+
+        await this.markAsInfrastructureFailure(
+          record,
+          'Execution surface mismatch: step required desktop tools; upgraded to DESKTOP and will retry',
+        );
         return;
       }
     }
 
-    this.logger.log(`Task ${record.taskId} needs user help for item ${record.checklistItemId}`);
-    const promptKind = task.requiresDesktop
-      ? UserPromptKind.DESKTOP_TAKEOVER
-      : UserPromptKind.TEXT_CLARIFICATION;
+    // Gold-Standard policy: NEVER convert internal strategy/runtime failures into a user prompt.
+    // Prompts are reserved for true external input / human action cases only (typed by errorCode).
+    if (classification.handling !== 'USER_PROMPT') {
+      const message = this.formatNeedsHelpFailureMessage(needsHelp, needsHelp.errorCode);
+
+      if (classification.handling === 'INFRA_FAILURE') {
+        await this.markAsInfrastructureFailure(record, message);
+        return;
+      }
+
+      await this.handleTaskFailed(record, message, task.title, 'SEMANTIC');
+      return;
+    }
+
+    this.logger.log(
+      `Task ${record.taskId} needs user help for item ${record.checklistItemId} (code=${needsHelp.errorCode})`,
+    );
+
+    const promptKind = this.getPromptKindForNeedsHelpCode(needsHelp.errorCode, task);
 
     const appBaseUrl = this.configService.get<string>('APP_BASE_URL', 'https://app.bytebot.ai');
     const desktopTakeoverLink =
@@ -1171,19 +1225,174 @@ export class TaskDispatchService implements OnModuleInit {
       checklistItemId: record.checklistItemId,
       taskId: record.taskId,
       reason: 'Task requires user input to continue',
+      needsHelp: {
+        errorCode: needsHelp.errorCode,
+        message: needsHelp.message ?? null,
+      },
     });
   }
 
-  private extractNeedsHelpResult(task: AgentTask): NeedsHelpResult | null {
-    const raw = task.result;
-    if (!raw || typeof raw !== 'object') return null;
+  private inferStrategyDefault(goal: string, question: string): StrategyDefaultDecision {
+    const haystack = `${goal || ''}\n${question || ''}`.toLowerCase();
 
-    const result = raw as NeedsHelpResult;
-    if (typeof result.errorCode !== 'string' || result.errorCode.trim().length === 0) {
-      return null;
+    if (haystack.includes('flight') || haystack.includes('airfare') || haystack.includes('airline')) {
+      return {
+        key: 'flightSite',
+        name: 'Google Flights',
+        url: 'https://www.google.com/travel/flights',
+      };
     }
 
-    return result;
+    if (
+      haystack.includes('hotel') ||
+      haystack.includes('lodging') ||
+      haystack.includes('accommodation')
+    ) {
+      return {
+        key: 'hotelSite',
+        name: 'Booking.com',
+        url: 'https://www.booking.com',
+      };
+    }
+
+    if (haystack.includes('car rental') || (haystack.includes('car') && haystack.includes('rental'))) {
+      return {
+        key: 'carRentalSite',
+        name: 'KAYAK',
+        url: 'https://www.kayak.com',
+      };
+    }
+
+    return {
+      key: 'searchSite',
+      name: 'Google',
+      url: 'https://www.google.com',
+    };
+  }
+
+  private async autoResolveStrategyAndRetry(
+    record: DispatchRecord,
+    needsHelp: NeedsHelpResult,
+  ): Promise<boolean> {
+    const question = typeof needsHelp.message === 'string' ? needsHelp.message.trim() : '';
+
+    const [goalRun, item] = await Promise.all([
+      this.prisma.goalRun.findUnique({
+        where: { id: record.goalRunId },
+        select: { goal: true, constraints: true },
+      }),
+      this.prisma.checklistItem.findUnique({
+        where: { id: record.checklistItemId },
+        select: { description: true },
+      }),
+    ]);
+
+    const currentDescription = item?.description ?? '';
+    if (currentDescription.includes(STRATEGY_DEFAULT_MARKER)) {
+      // Avoid an infinite retry loop if the agent keeps trying to ask a strategy question.
+      return false;
+    }
+
+    const goal = goalRun?.goal ?? '';
+    const decision = this.inferStrategyDefault(goal, question);
+
+    const nextDescription = `${currentDescription}\n\n${STRATEGY_DEFAULT_MARKER}: Use ${decision.name} (${decision.url}) as the default for this step. Do not ask the user to choose a site.`;
+
+    await this.prisma.checklistItem.update({
+      where: { id: record.checklistItemId },
+      data: { description: nextDescription },
+    });
+
+    if (goalRun) {
+      const constraints =
+        goalRun.constraints && typeof goalRun.constraints === 'object'
+          ? { ...(goalRun.constraints as any) }
+          : {};
+      const strategyDefaults =
+        constraints.strategyDefaults && typeof constraints.strategyDefaults === 'object'
+          ? { ...(constraints.strategyDefaults as any) }
+          : {};
+
+      strategyDefaults[decision.key] = { name: decision.name, url: decision.url };
+      constraints.strategyDefaults = strategyDefaults;
+
+      await this.prisma.goalRun.update({
+        where: { id: record.goalRunId },
+        data: { constraints },
+      });
+    }
+
+    await this.emitActivityEvent(
+      record.goalRunId,
+      'STRATEGY_AUTO_RESOLVED',
+      `Strategy auto-resolved: ${decision.name}`,
+      {
+        checklistItemId: record.checklistItemId,
+        taskId: record.taskId,
+        errorCode: needsHelp.errorCode,
+        decision,
+        question: question || null,
+      },
+    );
+
+    await this.markAsInfrastructureFailure(
+      record,
+      `Strategy question auto-resolved (${decision.name}); retrying step`,
+    );
+
+    return true;
+  }
+
+  private normalizeNeedsHelpResult(task: AgentTask): Required<Pick<NeedsHelpResult, 'errorCode'>> & NeedsHelpResult {
+    const raw = task.result;
+    const base: NeedsHelpResult =
+      raw && typeof raw === 'object'
+        ? (raw as NeedsHelpResult)
+        : {};
+
+    const rawErrorCode = typeof base.errorCode === 'string' ? base.errorCode.trim() : '';
+    const rawMessage = typeof base.message === 'string' ? base.message.trim() : '';
+
+    // Contract: errorCode is required. If missing, treat as contract violation and route to INTERNAL_REPAIR.
+    let errorCode = rawErrorCode || CONTRACT_VIOLATION_UNTYPED_NEEDS_HELP;
+
+    // Contract: AGENT_REQUESTED_HELP must never create WAITING_USER_INPUT; treat as strategy-as-help violation.
+    if (errorCode === 'AGENT_REQUESTED_HELP') {
+      errorCode = CONTRACT_VIOLATION_STRATEGY_AS_HELP;
+    }
+
+    const message =
+      rawMessage ||
+      (typeof (raw as any)?.description === 'string' ? String((raw as any).description).trim() : '') ||
+      (typeof (raw as any)?.reason === 'string' ? String((raw as any).reason).trim() : '') ||
+      (typeof (raw as any)?.question === 'string' ? String((raw as any).question).trim() : '') ||
+      '';
+
+    const details =
+      base.details && typeof base.details === 'object'
+        ? base.details
+        : undefined;
+
+    return {
+      errorCode,
+      ...(message ? { message } : {}),
+      ...(details ? { details } : {}),
+    };
+  }
+
+  private getPromptKindForNeedsHelpCode(errorCode: string, task: AgentTask): UserPromptKind {
+    // NOTE: This is only used when classifyNeedsHelpHandling(errorCode) === USER_PROMPT.
+    // Keep mapping explicit; do not infer from natural language.
+    switch (errorCode) {
+      case 'UI_BLOCKED_SIGNIN':
+      case 'UI_BLOCKED_POPUP':
+        return UserPromptKind.DESKTOP_TAKEOVER;
+      case 'DISPATCHED_USER_PROMPT_STEP':
+        return UserPromptKind.TEXT_CLARIFICATION;
+      default:
+        // Defensive fallback: if we somehow got here, preserve prior behavior but do not broaden prompt eligibility.
+        return task.requiresDesktop ? UserPromptKind.DESKTOP_TAKEOVER : UserPromptKind.TEXT_CLARIFICATION;
+    }
   }
 
   private classifyNeedsHelpHandling(errorCode: string): { handling: 'USER_PROMPT' | 'SEMANTIC_FAILURE' | 'INFRA_FAILURE' } {
@@ -1191,7 +1400,6 @@ export class TaskDispatchService implements OnModuleInit {
     // Everything else must be handled internally (retry/replan/pause) without spamming prompts.
     const userPromptCodes = new Set<string>([
       'DISPATCHED_USER_PROMPT_STEP',
-      'AGENT_REQUESTED_HELP',
       'UI_BLOCKED_SIGNIN',
       'UI_BLOCKED_POPUP',
     ]);

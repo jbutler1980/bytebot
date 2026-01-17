@@ -72,6 +72,7 @@ import { TemplateSeedService } from './services/template-seed.service';
 import { SlackNotificationService } from './services/slack-notification.service';
 import { TeamsNotificationService } from './services/teams-notification.service';
 import { GitIntegrationService } from './services/git-integration.service';
+import { SlackBridgeService } from './services/slack-bridge.service';
 // Phase 9 (v5.4.0): Advanced AI Features - Goal Refinement, Template Generation, Failure Analysis
 import { GoalRefinementService } from './services/goal-refinement.service';
 import { TemplateGenerationService } from './services/template-generation.service';
@@ -134,6 +135,7 @@ import { BatchController } from './controllers/batch.controller';
 // Phase 8 (v5.3.0): External Integrations controllers
 import { NotificationController } from './controllers/notification.controller';
 import { GitIntegrationController } from './controllers/git-integration.controller';
+import { SlackBridgeController } from './controllers/slack-bridge.controller';
 // Phase 9 (v5.4.0): Advanced AI Features controller
 import { AiFeaturesController } from './controllers/ai-features.controller';
 // Phase 10 (v5.5.0): Enterprise Features controller
@@ -221,6 +223,7 @@ import { MetricsModule } from './modules/metrics.module';
     BatchController,
     // Phase 8 (v5.3.0): External Integrations
     NotificationController,
+    SlackBridgeController,
     GitIntegrationController,
     // Phase 9 (v5.4.0): Advanced AI Features
     AiFeaturesController,
@@ -310,6 +313,7 @@ import { MetricsModule } from './modules/metrics.module';
     SlackNotificationService,
     TeamsNotificationService,
     GitIntegrationService,
+    SlackBridgeService,
     // Phase 9 (v5.4.0): Advanced AI Features - Goal Refinement, Template Generation, Failure Analysis
     GoalRefinementService,
     TemplateGenerationService,

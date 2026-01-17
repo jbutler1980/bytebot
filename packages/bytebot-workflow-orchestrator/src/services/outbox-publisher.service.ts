@@ -234,6 +234,7 @@ export class OutboxPublisherService implements OnModuleInit {
     switch (row.eventType) {
       case SlackEventType.USER_PROMPT_CREATED:
       case SlackEventType.USER_PROMPT_RESOLVED:
+      case SlackEventType.USER_PROMPT_CANCELLED:
         await this.publishUserPrompt(row, row.eventType);
         return;
       case 'user_prompt.resume':
@@ -244,7 +245,13 @@ export class OutboxPublisherService implements OnModuleInit {
     }
   }
 
-  private async publishUserPrompt(row: Outbox, eventType: SlackEventType.USER_PROMPT_CREATED | SlackEventType.USER_PROMPT_RESOLVED): Promise<void> {
+  private async publishUserPrompt(
+    row: Outbox,
+    eventType:
+      | SlackEventType.USER_PROMPT_CREATED
+      | SlackEventType.USER_PROMPT_RESOLVED
+      | SlackEventType.USER_PROMPT_CANCELLED,
+  ): Promise<void> {
     const payload = row.payload as unknown as UserPromptOutboxPayload;
 
     const tenantId = await this.resolveTenantId(payload.tenantId ?? null, payload.goalRunId ?? row.aggregateId ?? null);

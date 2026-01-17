@@ -67,6 +67,27 @@ export class MetricsService {
     registers: [this.registry],
   });
 
+  private readonly desktopKeydownRewrittenTotal = new Counter({
+    name: 'bytebot_desktop_keydown_rewritten_total',
+    help: 'Total illegal key-down requests rewritten into safe taps',
+    labelNames: ['key', 'reason'] as const,
+    registers: [this.registry],
+  });
+
+  private readonly desktopInterruptsTotal = new Counter({
+    name: 'bytebot_desktop_interrupts_total',
+    help: 'Total desktop automation interrupts raised for safety',
+    labelNames: ['reason_code'] as const,
+    registers: [this.registry],
+  });
+
+  private readonly desktopLoopDetectedTotal = new Counter({
+    name: 'bytebot_desktop_loop_detected_total',
+    help: 'Total desktop loop detections (no progress)',
+    labelNames: ['rule'] as const,
+    registers: [this.registry],
+  });
+
   constructor() {
     collectDefaultMetrics({ register: this.registry });
   }
@@ -116,5 +137,20 @@ export class MetricsService {
       { endpoint: event.endpoint, requested_model: event.requestedModel },
       event.durationMs / 1000,
     );
+  }
+
+  @OnEvent('desktop.keydown.rewritten')
+  onDesktopKeydownRewritten(event: { key: string; reason: string }): void {
+    this.desktopKeydownRewrittenTotal.inc({ key: event.key, reason: event.reason });
+  }
+
+  @OnEvent('desktop.interrupt')
+  onDesktopInterrupt(event: { reasonCode: string }): void {
+    this.desktopInterruptsTotal.inc({ reason_code: event.reasonCode });
+  }
+
+  @OnEvent('desktop.loop.detected')
+  onDesktopLoopDetected(event: { rule: string }): void {
+    this.desktopLoopDetectedTotal.inc({ rule: event.rule });
   }
 }

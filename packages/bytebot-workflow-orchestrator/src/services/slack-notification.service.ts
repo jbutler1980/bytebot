@@ -74,6 +74,7 @@ export enum SlackEventType {
   APPROVAL_EXPIRED = 'approval.expired',
   USER_PROMPT_CREATED = 'user_prompt.created',
   USER_PROMPT_RESOLVED = 'user_prompt.resolved',
+  USER_PROMPT_CANCELLED = 'user_prompt.cancelled',
 }
 
 // Event data interfaces
@@ -585,6 +586,7 @@ export class SlackNotificationService {
     const { emoji, color, title } = this.getUserPromptEventStyle(eventType);
 
     const goalRunLink = data.links?.goalRun || `${this.baseUrl}/goals/${data.goalRunId}`;
+    const promptLink = data.links?.prompt || `${this.baseUrl}/prompts/${data.promptId}`;
     const desktopTakeoverLink = data.links?.desktopTakeover || null;
     const checklistLabel = data.checklistItemId ? `Checklist Item: \`${data.checklistItemId}\`` : 'Checklist Item: (none)';
 
@@ -614,6 +616,42 @@ export class SlackNotificationService {
     ];
 
     const actionElements: any[] = [];
+    if (promptLink) {
+      actionElements.push({
+        type: 'button',
+        text: {
+          type: 'plain_text',
+          text: 'Open Prompt',
+          emoji: true,
+        },
+        url: promptLink,
+        style: eventType === SlackEventType.USER_PROMPT_CREATED ? 'primary' : 'default',
+      });
+    }
+
+    // Reply-in-Slack (v2): requires a Slack app with interactive components + server-side signature verification.
+    if (
+      eventType === SlackEventType.USER_PROMPT_CREATED &&
+      data.kind === 'TEXT_CLARIFICATION' &&
+      this.isReplyInSlackEnabled()
+    ) {
+      actionElements.push({
+        type: 'button',
+        action_id: 'bytebot_user_prompt_reply',
+        text: {
+          type: 'plain_text',
+          text: 'Reply in Slack',
+          emoji: true,
+        },
+        value: JSON.stringify({
+          promptId: data.promptId,
+          tenantId: data.tenantId,
+          goalRunId: data.goalRunId,
+          kind: data.kind,
+        }),
+      });
+    }
+
     if (goalRunLink) {
       actionElements.push({
         type: 'button',
@@ -665,6 +703,14 @@ export class SlackNotificationService {
         },
       ],
     };
+  }
+
+  private isReplyInSlackEnabled(): boolean {
+    return (
+      (this.configService.get<string>('SLACK_REPLY_IN_SLACK_ENABLED') || '')
+        .trim()
+        .toLowerCase() === 'true'
+    );
   }
 
   /**
@@ -928,6 +974,8 @@ export class SlackNotificationService {
         return { emoji: ':speech_balloon:', color: '#FF9800', title: 'User Input Required' };
       case SlackEventType.USER_PROMPT_RESOLVED:
         return { emoji: ':white_check_mark:', color: '#4CAF50', title: 'User Input Resolved' };
+      case SlackEventType.USER_PROMPT_CANCELLED:
+        return { emoji: ':no_entry_sign:', color: '#9E9E9E', title: 'User Prompt Cancelled' };
       default:
         return { emoji: ':speech_balloon:', color: '#607D8B', title: 'User Prompt Update' };
     }

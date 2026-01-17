@@ -22,6 +22,7 @@ import {
   isReadFileToolUseBlock,
 } from '@bytebot/shared';
 import { Logger } from '@nestjs/common';
+import { buildDesktopActionSignature, isModifierKeyName } from './agent.desktop-safety';
 
 /**
  * Fallback desktop URL for legacy mode (Phase 6 not deployed)
@@ -87,6 +88,9 @@ export interface ActionResult {
   coordinates?: { x: number; y: number };
   errorMessage?: string;
   input?: Record<string, unknown>;
+  actionSignature?: string;
+  screenshotHash?: string;
+  screenshotCaptured?: boolean;
 }
 
 /**
@@ -115,16 +119,21 @@ export async function handleComputerToolUse(
 
   if (isScreenshotToolUseBlock(block)) {
     logger.debug('Processing screenshot request');
+    const actionSignature = buildDesktopActionSignature(block);
     const startTime = Date.now();
     try {
       logger.debug('Taking screenshot');
-      const image = await screenshot(desktopUrl);
+      const shot = await screenshot(desktopUrl);
       logger.debug('Screenshot captured successfully');
 
       reportAction({
-        actionType: 'screenshot',
+        actionType: block.name,
         success: true,
         durationMs: Date.now() - startTime,
+        actionSignature,
+        screenshotHash: shot.imageHash,
+        screenshotCaptured: true,
+        input: { signature: actionSignature },
       });
 
       return {
@@ -134,7 +143,7 @@ export async function handleComputerToolUse(
           {
             type: MessageContentType.Image,
             source: {
-              data: image,
+              data: shot.image,
               media_type: 'image/png',
               type: 'base64',
             },
@@ -144,10 +153,13 @@ export async function handleComputerToolUse(
     } catch (error) {
       logger.error(`Screenshot failed: ${error.message}`, error.stack);
       reportAction({
-        actionType: 'screenshot',
+        actionType: block.name,
         success: false,
         durationMs: Date.now() - startTime,
         errorMessage: error.message,
+        actionSignature,
+        screenshotCaptured: false,
+        input: { signature: actionSignature },
       });
       return {
         type: MessageContentType.ToolResult,
@@ -165,6 +177,7 @@ export async function handleComputerToolUse(
 
   if (isCursorPositionToolUseBlock(block)) {
     logger.debug('Processing cursor position request');
+    const actionSignature = buildDesktopActionSignature(block);
     const startTime = Date.now();
     try {
       logger.debug('Getting cursor position');
@@ -172,10 +185,13 @@ export async function handleComputerToolUse(
       logger.debug(`Cursor position obtained: ${position.x}, ${position.y}`);
 
       reportAction({
-        actionType: 'cursor_position',
+        actionType: block.name,
         success: true,
         durationMs: Date.now() - startTime,
         coordinates: position,
+        actionSignature,
+        screenshotCaptured: false,
+        input: { signature: actionSignature },
       });
 
       return {
@@ -194,10 +210,13 @@ export async function handleComputerToolUse(
         error.stack,
       );
       reportAction({
-        actionType: 'cursor_position',
+        actionType: block.name,
         success: false,
         durationMs: Date.now() - startTime,
         errorMessage: error.message,
+        actionSignature,
+        screenshotCaptured: false,
+        input: { signature: actionSignature },
       });
       return {
         type: MessageContentType.ToolResult,
@@ -216,6 +235,7 @@ export async function handleComputerToolUse(
   const startTime = Date.now();
   let actionType = block.name;
   let actionCoordinates: { x: number; y: number } | undefined;
+  const actionSignature = buildDesktopActionSignature(block);
 
   try {
     if (isMoveMouseToolUseBlock(block)) {
@@ -316,15 +336,10 @@ export async function handleComputerToolUse(
       }
     }
 
-    // Report successful action
-    reportAction({
-      actionType,
-      success: true,
-      durationMs: Date.now() - startTime,
-      coordinates: actionCoordinates,
-    });
+    const actionDurationMs = Date.now() - startTime;
 
     let image: string | null = null;
+    let screenshotHash: string | undefined;
     try {
       // Wait before taking screenshot to allow UI to settle
       const delayMs = 750; // 750ms delay
@@ -332,7 +347,9 @@ export async function handleComputerToolUse(
       await new Promise((resolve) => setTimeout(resolve, delayMs));
 
       logger.debug('Taking screenshot');
-      image = await screenshot(desktopUrl);
+      const shot = await screenshot(desktopUrl);
+      image = shot.image;
+      screenshotHash = shot.imageHash;
       logger.debug('Screenshot captured successfully');
     } catch (error) {
       logger.error('Failed to take screenshot', error);
@@ -361,12 +378,37 @@ export async function handleComputerToolUse(
       });
     }
 
+    // Emit screenshot hash for loop detection / observability (no base64).
+    reportAction({
+      actionType,
+      success: true,
+      durationMs: actionDurationMs,
+      coordinates: actionCoordinates,
+      actionSignature,
+      screenshotHash,
+      screenshotCaptured: Boolean(image),
+      input: { signature: actionSignature },
+    });
+
     return toolResult;
   } catch (error) {
     logger.error(
       `Error executing ${block.name} tool: ${error.message}`,
       error.stack,
     );
+
+    // Best-effort: ensure no stuck input state if an input-affecting tool failed.
+    if (
+      block.name === 'computer_press_keys' ||
+      block.name === 'computer_press_mouse' ||
+      block.name === 'computer_drag_mouse'
+    ) {
+      try {
+        await resetDesktopInput(desktopUrl);
+      } catch (resetError: any) {
+        logger.warn(`Failed to reset desktop input: ${resetError.message}`);
+      }
+    }
 
     // Report failed action
     reportAction({
@@ -375,6 +417,9 @@ export async function handleComputerToolUse(
       durationMs: Date.now() - startTime,
       coordinates: actionCoordinates,
       errorMessage: error.message,
+      actionSignature,
+      screenshotCaptured: false,
+      input: { signature: actionSignature },
     });
 
     return {
@@ -405,13 +450,9 @@ async function moveMouse(
   );
 
   try {
-    await fetch(`${desktopUrl}/computer-use`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'move_mouse',
-        coordinates,
-      }),
+    await postComputerUse(desktopUrl, {
+      action: 'move_mouse',
+      coordinates,
     });
   } catch (error) {
     console.error('Error in move_mouse action:', error);
@@ -432,14 +473,10 @@ async function traceMouse(
   );
 
   try {
-    await fetch(`${desktopUrl}/computer-use`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'trace_mouse',
-        path,
-        holdKeys,
-      }),
+    await postComputerUse(desktopUrl, {
+      action: 'trace_mouse',
+      path,
+      holdKeys,
     });
   } catch (error) {
     console.error('Error in trace_mouse action:', error);
@@ -462,16 +499,12 @@ async function clickMouse(
   );
 
   try {
-    await fetch(`${desktopUrl}/computer-use`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'click_mouse',
-        coordinates,
-        button,
-        holdKeys: holdKeys && holdKeys.length > 0 ? holdKeys : undefined,
-        clickCount,
-      }),
+    await postComputerUse(desktopUrl, {
+      action: 'click_mouse',
+      coordinates,
+      button,
+      holdKeys: holdKeys && holdKeys.length > 0 ? holdKeys : undefined,
+      clickCount,
     });
   } catch (error) {
     console.error('Error in click_mouse action:', error);
@@ -493,15 +526,11 @@ async function pressMouse(
   );
 
   try {
-    await fetch(`${desktopUrl}/computer-use`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'press_mouse',
-        coordinates,
-        button,
-        press,
-      }),
+    await postComputerUse(desktopUrl, {
+      action: 'press_mouse',
+      coordinates,
+      button,
+      press,
     });
   } catch (error) {
     console.error('Error in press_mouse action:', error);
@@ -523,15 +552,11 @@ async function dragMouse(
   );
 
   try {
-    await fetch(`${desktopUrl}/computer-use`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'drag_mouse',
-        path,
-        button,
-        holdKeys: holdKeys && holdKeys.length > 0 ? holdKeys : undefined,
-      }),
+    await postComputerUse(desktopUrl, {
+      action: 'drag_mouse',
+      path,
+      button,
+      holdKeys: holdKeys && holdKeys.length > 0 ? holdKeys : undefined,
     });
   } catch (error) {
     console.error('Error in drag_mouse action:', error);
@@ -554,16 +579,12 @@ async function scroll(
   );
 
   try {
-    await fetch(`${desktopUrl}/computer-use`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'scroll',
-        coordinates,
-        direction,
-        scrollCount,
-        holdKeys: holdKeys && holdKeys.length > 0 ? holdKeys : undefined,
-      }),
+    await postComputerUse(desktopUrl, {
+      action: 'scroll',
+      coordinates,
+      direction,
+      scrollCount,
+      holdKeys: holdKeys && holdKeys.length > 0 ? holdKeys : undefined,
     });
   } catch (error) {
     console.error('Error in scroll action:', error);
@@ -582,14 +603,10 @@ async function typeKeys(
   console.log(`Typing keys: ${keys}`);
 
   try {
-    await fetch(`${desktopUrl}/computer-use`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'type_keys',
-        keys,
-        delay,
-      }),
+    await postComputerUse(desktopUrl, {
+      action: 'type_keys',
+      keys,
+      delay,
     });
   } catch (error) {
     console.error('Error in type_keys action:', error);
@@ -601,6 +618,8 @@ async function pressKeys(
   input: {
     keys: string[];
     press: Press;
+    holdMs?: number;
+    hold_ms?: number;
   },
   desktopUrl: string,
 ): Promise<void> {
@@ -608,14 +627,55 @@ async function pressKeys(
   console.log(`Pressing keys: ${keys}`);
 
   try {
-    await fetch(`${desktopUrl}/computer-use`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const holdMsRaw =
+      typeof (input as any).holdMs === 'number'
+        ? (input as any).holdMs
+        : typeof (input as any).hold_ms === 'number'
+          ? (input as any).hold_ms
+          : null;
+
+    const holdMs =
+      typeof holdMsRaw === 'number' && Number.isFinite(holdMsRaw) && holdMsRaw >= 0
+        ? Math.min(Math.floor(holdMsRaw), 750)
+        : null;
+
+    const hasNonModifier = keys.some((k) => !isModifierKeyName(k));
+
+    // Safety invariant: non-modifier holds are not allowed. Treat as atomic tap.
+    if (press === 'down' && hasNonModifier) {
+      await typeKeys({ keys, delay: 75 }, desktopUrl);
+      return;
+    }
+
+    // Safety invariant: modifier holds must be bounded. If holdMs isn't provided, treat as tap.
+    if (press === 'down' && !hasNonModifier && holdMs === null) {
+      await typeKeys({ keys, delay: 75 }, desktopUrl);
+      return;
+    }
+
+    if (press === 'down' && !hasNonModifier && holdMs !== null) {
+      await postComputerUse(desktopUrl, {
         action: 'press_keys',
         keys,
-        press,
-      }),
+        press: 'down',
+      });
+
+      try {
+        await new Promise((resolve) => setTimeout(resolve, holdMs));
+      } finally {
+        await postComputerUse(desktopUrl, {
+          action: 'press_keys',
+          keys,
+          press: 'up',
+        });
+      }
+      return;
+    }
+
+    await postComputerUse(desktopUrl, {
+      action: 'press_keys',
+      keys,
+      press,
     });
   } catch (error) {
     console.error('Error in press_keys action:', error);
@@ -634,14 +694,10 @@ async function typeText(
   console.log(`Typing text: ${text}`);
 
   try {
-    await fetch(`${desktopUrl}/computer-use`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'type_text',
-        text,
-        delay,
-      }),
+    await postComputerUse(desktopUrl, {
+      action: 'type_text',
+      text,
+      delay,
     });
   } catch (error) {
     console.error('Error in type_text action:', error);
@@ -657,13 +713,9 @@ async function pasteText(
   console.log(`Pasting text: ${text}`);
 
   try {
-    await fetch(`${desktopUrl}/computer-use`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'paste_text',
-        text,
-      }),
+    await postComputerUse(desktopUrl, {
+      action: 'paste_text',
+      text,
     });
   } catch (error) {
     console.error('Error in paste_text action:', error);
@@ -679,13 +731,9 @@ async function wait(
   console.log(`Waiting for ${duration}ms`);
 
   try {
-    await fetch(`${desktopUrl}/computer-use`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'wait',
-        duration,
-      }),
+    await postComputerUse(desktopUrl, {
+      action: 'wait',
+      duration,
     });
   } catch (error) {
     console.error('Error in wait action:', error);
@@ -697,15 +745,9 @@ async function cursorPosition(desktopUrl: string): Promise<Coordinates> {
   console.log('Getting cursor position');
 
   try {
-    const response = await fetch(`${desktopUrl}/computer-use`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'cursor_position',
-      }),
+    const data = await postComputerUseJson<{ x: number; y: number }>(desktopUrl, {
+      action: 'cursor_position',
     });
-
-    const data = await response.json();
     return { x: data.x, y: data.y };
   } catch (error) {
     console.error('Error in cursor_position action:', error);
@@ -713,31 +755,24 @@ async function cursorPosition(desktopUrl: string): Promise<Coordinates> {
   }
 }
 
-async function screenshot(desktopUrl: string): Promise<string> {
+async function screenshot(
+  desktopUrl: string,
+): Promise<{ image: string; imageHash?: string }> {
   console.log('Taking screenshot');
 
   try {
-    const requestBody = {
-      action: 'screenshot',
-    };
-
-    const response = await fetch(`${desktopUrl}/computer-use`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(requestBody),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Failed to take screenshot: ${response.statusText}`);
-    }
-
-    const data = await response.json();
+    const data = await postComputerUseJson<{ image?: string; imageHash?: string }>(
+      desktopUrl,
+      {
+        action: 'screenshot',
+      },
+    );
 
     if (!data.image) {
       throw new Error('Failed to take screenshot: No image data received');
     }
 
-    return data.image; // Base64 encoded image
+    return { image: data.image, imageHash: data.imageHash };
   } catch (error) {
     console.error('Error in screenshot action:', error);
     throw error;
@@ -752,13 +787,9 @@ async function application(
   console.log(`Opening application: ${app}`);
 
   try {
-    await fetch(`${desktopUrl}/computer-use`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'application',
-        application: app,
-      }),
+    await postComputerUse(desktopUrl, {
+      action: 'application',
+      application: app,
     });
   } catch (error) {
     console.error('Error in application action:', error);
@@ -781,20 +812,10 @@ async function readFile(
   console.log(`Reading file: ${path}`);
 
   try {
-    const response = await fetch(`${desktopUrl}/computer-use`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'read_file',
-        path,
-      }),
+    const data = await postComputerUseJson<any>(desktopUrl, {
+      action: 'read_file',
+      path,
     });
-
-    if (!response.ok) {
-      throw new Error(`Failed to read file: ${response.statusText}`);
-    }
-
-    const data = await response.json();
     return data;
   } catch (error) {
     console.error('Error in read_file action:', error);
@@ -823,21 +844,11 @@ export async function writeFile(
     // Content is always base64 encoded
     const base64Data = content;
 
-    const response = await fetch(`${url}/computer-use`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'write_file',
-        path,
-        data: base64Data,
-      }),
+    const data = await postComputerUseJson<any>(url, {
+      action: 'write_file',
+      path,
+      data: base64Data,
     });
-
-    if (!response.ok) {
-      throw new Error(`Failed to write file: ${response.statusText}`);
-    }
-
-    const data = await response.json();
     return data;
   } catch (error) {
     console.error('Error in write_file action:', error);
@@ -845,5 +856,127 @@ export async function writeFile(
       success: false,
       message: `Error writing file: ${error.message}`,
     };
+  }
+}
+
+type DesktopCapabilities = {
+  resetInput?: boolean;
+  screenshotHash?: boolean;
+};
+
+const DESKTOP_CAPABILITIES_TTL_MS = parseInt(
+  process.env.BYTEBOT_DESKTOP_CAPABILITIES_TTL_MS || '300000',
+  10,
+);
+
+const desktopCapabilitiesCache = new Map<
+  string,
+  { checkedAt: number; capabilities: DesktopCapabilities }
+>();
+
+async function getDesktopCapabilities(desktopUrl: string): Promise<DesktopCapabilities | null> {
+  const now = Date.now();
+  const cached = desktopCapabilitiesCache.get(desktopUrl);
+  if (cached && now - cached.checkedAt < DESKTOP_CAPABILITIES_TTL_MS) {
+    return cached.capabilities;
+  }
+
+  try {
+    const response = await fetch(`${desktopUrl}/computer-use/capabilities`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    if (!response.ok) {
+      // Backward compatibility: older daemons may not expose a capabilities endpoint yet.
+      // Do not treat 404 as "feature unsupported" because reset-input may still exist.
+      if (response.status === 404) return null;
+      return null;
+    }
+
+    const json = (await response.json()) as DesktopCapabilities;
+    const capabilities: DesktopCapabilities = {
+      resetInput: Boolean((json as any)?.resetInput),
+      screenshotHash: Boolean((json as any)?.screenshotHash),
+    };
+    desktopCapabilitiesCache.set(desktopUrl, { checkedAt: now, capabilities });
+    return capabilities;
+  } catch {
+    return null;
+  }
+}
+
+export async function resetDesktopInput(desktopUrl: string): Promise<void> {
+  const capabilities = await getDesktopCapabilities(desktopUrl);
+  if (capabilities && capabilities.resetInput === false) {
+    return;
+  }
+
+  const response = await fetch(`${desktopUrl}/computer-use/reset-input`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+
+  // Backward compatibility with older daemon images.
+  if (response.status === 404) {
+    desktopCapabilitiesCache.set(desktopUrl, {
+      checkedAt: Date.now(),
+      capabilities: { resetInput: false, screenshotHash: false },
+    });
+    return;
+  }
+
+  if (!response.ok) {
+    const text = await safeReadResponseText(response);
+    throw new Error(
+      `Failed to reset desktop input: ${response.status} ${response.statusText} ${text}`.trim(),
+    );
+  }
+}
+
+async function postComputerUse(
+  desktopUrl: string,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const response = await fetch(`${desktopUrl}/computer-use`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const text = await safeReadResponseText(response);
+    throw new Error(
+      `Desktop action failed: ${response.status} ${response.statusText} ${text}`.trim(),
+    );
+  }
+}
+
+async function postComputerUseJson<T>(
+  desktopUrl: string,
+  body: Record<string, unknown>,
+): Promise<T> {
+  const response = await fetch(`${desktopUrl}/computer-use`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const text = await safeReadResponseText(response);
+    throw new Error(
+      `Desktop action failed: ${response.status} ${response.statusText} ${text}`.trim(),
+    );
+  }
+
+  return (await response.json()) as T;
+}
+
+async function safeReadResponseText(response: Response): Promise<string> {
+  try {
+    const text = await response.text();
+    return text.length > 2048 ? `${text.slice(0, 2048)}…` : text;
+  } catch {
+    return '';
   }
 }

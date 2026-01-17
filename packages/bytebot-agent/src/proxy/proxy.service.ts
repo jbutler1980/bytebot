@@ -248,6 +248,79 @@ export class ProxyService implements BytebotAgentService {
     return sanitized;
   }
 
+  private coalesceAssistantMessages(
+    messages: ChatCompletionMessageParam[],
+  ): ChatCompletionMessageParam[] {
+    const coalesced: ChatCompletionMessageParam[] = [];
+
+    for (const message of messages) {
+      const previous = coalesced[coalesced.length - 1];
+      if (message.role !== 'assistant' || previous?.role !== 'assistant') {
+        coalesced.push(message);
+        continue;
+      }
+
+      const prev = previous as any;
+      const next = message as any;
+
+      const prevToolCalls = Array.isArray(prev.tool_calls) ? prev.tool_calls : [];
+      const nextToolCalls = Array.isArray(next.tool_calls) ? next.tool_calls : [];
+      const toolCalls = [...prevToolCalls, ...nextToolCalls];
+
+      const prevContent = prev.content;
+      const nextContent = next.content;
+
+      const mergedContent = this.mergeAssistantContent(prevContent, nextContent);
+
+      coalesced[coalesced.length - 1] = {
+        ...previous,
+        ...message,
+        ...(mergedContent != null && { content: mergedContent }),
+        ...(toolCalls.length > 0 && { tool_calls: toolCalls }),
+      };
+    }
+
+    return coalesced;
+  }
+
+  private mergeAssistantContent(
+    left: unknown,
+    right: unknown,
+  ): string | null {
+    const leftValue = this.normalizeAssistantContent(left);
+    const rightValue = this.normalizeAssistantContent(right);
+
+    if (leftValue == null) return rightValue;
+    if (rightValue == null) return leftValue;
+
+    const leftTrimmed = leftValue.trim();
+    const rightTrimmed = rightValue.trim();
+    if (!leftTrimmed) return rightValue;
+    if (!rightTrimmed) return leftValue;
+    return `${leftValue}\n\n${rightValue}`;
+  }
+
+  private normalizeAssistantContent(
+    value: unknown,
+  ): string | null {
+    if (value == null) return null;
+    if (typeof value === 'string') return value;
+    if (Array.isArray(value)) {
+      const parts = value
+        .map((part: any) => {
+          if (!part || typeof part !== 'object') return null;
+          if (part.type === 'text' && typeof part.text === 'string') return part.text;
+          if (typeof part.refusal === 'string') return part.refusal;
+          return null;
+        })
+        .filter((text): text is string => typeof text === 'string');
+
+      const combined = parts.join('\n').trim();
+      return combined ? combined : null;
+    }
+    return null;
+  }
+
   private isDesktopVisionRequestedModel(model: string): boolean {
     const trimmed = (model || '').trim();
     return (
@@ -321,11 +394,11 @@ export class ProxyService implements BytebotAgentService {
     const signal = options.signal;
 
     // Convert messages to Chat Completion format
-    const chatMessages = this.sanitizeChatMessages(this.formatMessagesForChatCompletion(
-      systemPrompt,
-      messages,
-      model,
-    ));
+    const chatMessages = this.coalesceAssistantMessages(
+      this.sanitizeChatMessages(
+        this.formatMessagesForChatCompletion(systemPrompt, messages, model),
+      ),
+    );
 
     // Determine if model supports reasoning_effort parameter
     // Only OpenAI o-series models (o1, o3, etc.) support this
@@ -341,7 +414,9 @@ export class ProxyService implements BytebotAgentService {
         )
       : [];
 
-    const completionRequest: OpenAI.Chat.ChatCompletionCreateParams = {
+    const completionRequest: OpenAI.Chat.ChatCompletionCreateParams & {
+      cache?: { 'no-cache': boolean };
+    } = {
       model,
       messages: chatMessages,
       max_tokens: 8192,
@@ -350,6 +425,12 @@ export class ProxyService implements BytebotAgentService {
       // Non-reasoning models (Claude, GPT-4, etc.) don't support this parameter
       ...(isReasoning && { reasoning_effort: 'high' }),
     };
+
+    // Desktop/Vision requests must be deterministic and must not be served from semantic cache.
+    // This prevents a cached fallback (e.g., gpt-4o-mini) from masking a healthy qwen3-vl-32b backend.
+    if (this.isDesktopVisionRequestedModel(model)) {
+      completionRequest.cache = { 'no-cache': true };
+    }
 
     const endpoints = this.getProxyEndpointsForModel(model);
     const attemptedEndpointKeys: string[] = [];

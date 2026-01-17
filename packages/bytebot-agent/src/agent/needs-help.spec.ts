@@ -1,4 +1,4 @@
-import { buildNeedsHelpResult } from './needs-help';
+import { buildNeedsHelpResult, parseNeedsHelpErrorCode } from './needs-help';
 
 describe('needs-help helpers', () => {
   it('uses default message when message is empty', () => {
@@ -24,5 +24,14 @@ describe('needs-help helpers', () => {
       details: { executionSurface: 'TEXT_ONLY' },
     });
   });
-});
 
+  it('parses known error codes and rejects unknowns', () => {
+    expect(parseNeedsHelpErrorCode('UI_BLOCKED_SIGNIN')).toBe('UI_BLOCKED_SIGNIN');
+    expect(parseNeedsHelpErrorCode('  UI_BLOCKED_POPUP  ')).toBe('UI_BLOCKED_POPUP');
+    expect(parseNeedsHelpErrorCode('CONTRACT_VIOLATION_UNTYPED_NEEDS_HELP')).toBe(
+      'CONTRACT_VIOLATION_UNTYPED_NEEDS_HELP',
+    );
+    expect(parseNeedsHelpErrorCode('NOT_A_REAL_CODE')).toBeNull();
+    expect(parseNeedsHelpErrorCode(null)).toBeNull();
+  });
+});

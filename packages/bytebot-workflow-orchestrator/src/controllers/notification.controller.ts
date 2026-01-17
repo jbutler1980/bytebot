@@ -650,6 +650,7 @@ export class NotificationController {
       // User prompt events (durable WAIT surface)
       SlackEventType.USER_PROMPT_CREATED,
       SlackEventType.USER_PROMPT_RESOLVED,
+      SlackEventType.USER_PROMPT_CANCELLED,
     ];
   }
 

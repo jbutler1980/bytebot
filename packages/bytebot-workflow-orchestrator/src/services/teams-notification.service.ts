@@ -88,6 +88,7 @@ export enum TeamsEventType {
   APPROVAL_EXPIRED = 'approval.expired',
   USER_PROMPT_CREATED = 'user_prompt.created',
   USER_PROMPT_RESOLVED = 'user_prompt.resolved',
+  USER_PROMPT_CANCELLED = 'user_prompt.cancelled',
 }
 
 // Event data interfaces (same as Slack)
@@ -255,6 +256,7 @@ export class TeamsNotificationService {
   private buildUserPromptCard(eventType: TeamsEventType, data: UserPromptEventData): AdaptiveCard {
     const { color, title, icon } = this.getUserPromptEventStyle(eventType);
     const goalRunLink = data.links?.goalRun || `${this.baseUrl}/goals/${data.goalRunId}`;
+    const promptLink = data.links?.prompt || `${this.baseUrl}/prompts/${data.promptId}`;
     const desktopTakeoverLink = data.links?.desktopTakeover || null;
 
     const body: AdaptiveCardElement[] = [
@@ -298,6 +300,9 @@ export class TeamsNotificationService {
     ];
 
     const actions: AdaptiveCardAction[] = [];
+    if (promptLink) {
+      actions.push({ type: 'Action.OpenUrl', title: 'Open Prompt', url: promptLink });
+    }
     if (goalRunLink) {
       actions.push({ type: 'Action.OpenUrl', title: 'Open Goal Run', url: goalRunLink });
     }
@@ -910,6 +915,8 @@ export class TeamsNotificationService {
         return { color: 'Warning', title: 'User Input Required', icon: '💬' };
       case TeamsEventType.USER_PROMPT_RESOLVED:
         return { color: 'Good', title: 'User Input Resolved', icon: '✅' };
+      case TeamsEventType.USER_PROMPT_CANCELLED:
+        return { color: 'Default', title: 'User Prompt Cancelled', icon: '⛔' };
       default:
         return { color: 'Default', title: 'User Prompt Update', icon: '💬' };
     }

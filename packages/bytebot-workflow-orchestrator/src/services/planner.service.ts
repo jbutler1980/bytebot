@@ -859,7 +859,7 @@ RULES:
 4. Include expected outcomes for verification
 5. Mark steps requiring desktop interaction
 6. suggestedTools MUST be [] or a subset of the Allowed tools list. Never invent tool tokens.
-7. If a step requires user clarification, set type=USER_INPUT_REQUIRED, requiresDesktop=false, and include suggestedTools=["ASK_USER"] (never "CHAT")
+7. Only use USER_INPUT_REQUIRED when truly blocked on external input (e.g., credentials, user-specific facts that cannot be assumed by policy, explicit approvals, or human takeover). Never ask the user to choose strategy (e.g., which website/tool to use) — pick a reliable default and proceed.
 8. The FIRST step MUST NOT be USER_INPUT_REQUIRED (or suggestedTools=["ASK_USER"]). If clarification is needed to start, assume safe defaults and proceed with an EXECUTE step.
 9. Consider potential failure points
 
@@ -997,8 +997,8 @@ CRITICAL RULES:
 6. The goal is to CONTINUE from where we left off, not start over
 7. Be more specific than the previous plan for steps that failed
 8. suggestedTools MUST be [] or a subset of the Allowed tools list. Never invent tool tokens.
-9. If a step requires user clarification, set type=USER_INPUT_REQUIRED, requiresDesktop=false, and include suggestedTools=["ASK_USER"] (never "CHAT")
-10. The FIRST NEW step you generate MUST NOT be USER_INPUT_REQUIRED (or suggestedTools=["ASK_USER"]). If clarification is needed, start with an EXECUTE "preflight" step that extracts assumptions/defaults, then ask the user in a later step.
+9. Only use USER_INPUT_REQUIRED when truly blocked on external input (credentials, user-specific facts that cannot be assumed by policy, explicit approvals, or human takeover). Never ask the user to choose strategy (e.g., which website/tool to use) — pick a reliable default and proceed.
+10. The FIRST NEW step you generate MUST NOT be USER_INPUT_REQUIRED (or suggestedTools=["ASK_USER"]). If clarification is needed, start with an EXECUTE "preflight" step that extracts assumptions/defaults and continues with safe defaults. Only ask the user later if policy forbids assumptions.
 
 EXAMPLE OF GOOD REPLANNING:
 - If "Search for flights" COMPLETED with results showing "Found $299 on United"

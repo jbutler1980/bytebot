@@ -252,6 +252,64 @@ describe('ProxyService endpoint failover', () => {
     expect(localCreate).toHaveBeenCalledTimes(0);
   });
 
+  it('disables LiteLLM caching for desktop-vision model requests', async () => {
+    const eventEmitter = { emit: jest.fn() };
+    const llmResilienceService = makeResilience(eventEmitter);
+
+    const configService = {
+      get: jest.fn((key: string) => {
+        const map: Record<string, string> = {
+          BYTEBOT_LLM_PROXY_URL: 'http://proxy:4000',
+          BYTEBOT_LLM_PROXY_ENDPOINTS: 'http://proxy:4000',
+          BYTEBOT_LLM_PROXY_DESKTOP_VISION_ENDPOINTS: 'http://proxy:4000',
+          BYTEBOT_LLM_PROXY_API_KEY: 'dummy',
+          BYTEBOT_LLM_PROXY_ENDPOINT_PREFLIGHT_ENABLED: 'false',
+        };
+        return map[key] ?? '';
+      }),
+    } as any;
+
+    const create = jest.fn(async (request: any) => {
+      return {
+        model: 'qwen3-vl-32b',
+        choices: [{ message: { content: 'ok' } }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        __request: request,
+      };
+    });
+
+    class TestProxyService extends ProxyService {
+      protected override createOpenAIClient(): any {
+        return { chat: { completions: { create } } };
+      }
+    }
+
+    const service = new TestProxyService(
+      configService,
+      llmResilienceService,
+      eventEmitter as any,
+    );
+
+    const messages = [
+      {
+        id: 'm1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        taskId: 't1',
+        summaryId: null,
+        role: Role.USER,
+        content: [{ type: MessageContentType.Text, text: 'hello' }],
+      },
+    ] as any;
+
+    await service.generateMessage('system', messages, 'openai/qwen3-vl-32b', {
+      useTools: false,
+    });
+
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(create.mock.calls[0][0].cache).toEqual({ 'no-cache': true });
+  });
+
   it('does not replay Thinking blocks into Chat Completions history', async () => {
     const eventEmitter = { emit: jest.fn() };
     const llmResilienceService = makeResilience(eventEmitter);
@@ -644,5 +702,77 @@ describe('ProxyService endpoint failover', () => {
         expect.objectContaining({ role: 'assistant', content: '   ' }),
       ]),
     );
+  });
+
+  it('coalesces consecutive assistant messages to satisfy strict OpenAI-compatible validators', async () => {
+    const eventEmitter = { emit: jest.fn() };
+    const llmResilienceService = makeResilience(eventEmitter);
+
+    const configService = {
+      get: jest.fn((key: string) => {
+        const map: Record<string, string> = {
+          BYTEBOT_LLM_PROXY_URL: 'http://global-proxy:4000',
+          BYTEBOT_LLM_PROXY_ENDPOINTS: 'http://global-proxy:4000',
+          BYTEBOT_LLM_PROXY_DESKTOP_VISION_ENDPOINTS: 'http://global-proxy:4000',
+          BYTEBOT_LLM_PROXY_API_KEY: 'dummy',
+          BYTEBOT_LLM_PROXY_ENDPOINT_PREFLIGHT_ENABLED: 'false',
+        };
+        return map[key] ?? '';
+      }),
+    } as any;
+
+    let capturedRequest: any | undefined;
+    const globalCreate = jest.fn(async (req: any) => {
+      capturedRequest = req;
+      return {
+        model: 'gpt-oss-120b',
+        choices: [{ message: { content: 'ok' } }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      };
+    });
+
+    class TestProxyService extends ProxyService {
+      protected override createOpenAIClient(): any {
+        return { chat: { completions: { create: globalCreate } } };
+      }
+    }
+
+    const service = new TestProxyService(
+      configService,
+      llmResilienceService,
+      eventEmitter as any,
+    );
+
+    const messages = [
+      {
+        id: 'm1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        taskId: 't1',
+        summaryId: null,
+        role: Role.ASSISTANT,
+        content: [{ type: MessageContentType.Text, text: 'first' }],
+      },
+      {
+        id: 'm2',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        taskId: 't1',
+        summaryId: null,
+        role: Role.ASSISTANT,
+        content: [{ type: MessageContentType.Text, text: 'second' }],
+      },
+    ] as any;
+
+    await service.generateMessage('system', messages, 'gpt-oss-120b', { useTools: false });
+    expect(globalCreate).toHaveBeenCalledTimes(1);
+
+    const roles = (capturedRequest?.messages || []).map((m: any) => m.role);
+    // Only one assistant message should remain.
+    expect(roles.filter((r: string) => r === 'assistant')).toHaveLength(1);
+
+    const assistant = (capturedRequest?.messages || []).find((m: any) => m.role === 'assistant');
+    expect(assistant?.content).toContain('first');
+    expect(assistant?.content).toContain('second');
   });
 });
